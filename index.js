@@ -119,75 +119,67 @@ app.get("/oauth/discord/callback", async (req, res) => {
   }
 });
 
-// =========================
-// RECLUTAMIENTO - POST A DISCORD
-// =========================
+// RECLUTAMIENTO - POST A DISCORD (ACK rápido para evitar 504)
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
-    const {
-      guildId,
-      channelId,
-      discordUserId,
-      discordTag,
-      answers
-    } = req.body || {};
+    const { guildId, channelId, discordUserId, discordTag, answers } = req.body || {};
 
     if (!guildId || !channelId || !discordUserId || !answers) {
       return res.status(400).json({ ok: false, error: "Missing fields" });
     }
 
-    const guild = await client.guilds.fetch(guildId);
-    if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
+    // ✅ Responde rápido para que Wix no timeoutee
+    res.status(200).json({ ok: true, queued: true, messageId: null });
 
-    const channel = await guild.channels.fetch(channelId);
-    if (!channel || !channel.isTextBased()) {
-      return res.status(404).json({ ok: false, error: "Channel not found or not text" });
-    }
+    // ✅ Envío a Discord en background
+    setImmediate(async () => {
+      try {
+        const guild =
+          client.guilds.cache.get(guildId) || (await client.guilds.fetch(guildId));
 
-    // 🧠 Construcción del mensaje (Discord tiene límite ~2000 chars)
-    // Si luego quieres, lo convertimos a embeds o lo recortamos automáticamente.
-    const lines = [
-      "🛡️ **Nueva Solicitud de Reclutamiento – Ataraxia**",
-      "",
-      `👤 **Discord:** ${discordTag || "Usuario"} (<@${discordUserId}>)`,
-      `🆔 **ID:** ${discordUserId}`,
-      "",
-      "**Respuestas:**",
-      `1️⃣ Gameplay: **${answers.gameplayType}**`,
-      `2️⃣ Días/semana: **${answers.daysPerWeek}**`,
-      `3️⃣ Perder loot por la guild: **${answers.loseLoot}**`,
-      `4️⃣ Ayudar a nuevos: **${answers.helpNewbies}**`,
-      `5️⃣ Acepta jerarquía: **${answers.acceptHierarchy}**`,
-      `6️⃣ Experiencia en guilds grandes: **${answers.bigGuilds}**`,
-      `7️⃣ Rol: **${answers.leaderOrExecutor}**`,
-      `8️⃣ Seguir órdenes en PvP masivo: **${answers.followOrdersMassPvp}**`,
-      "",
-      "🧠 **Si un líder se equivoca:**",
-      String(answers.badLeaderDecision || ""),
-      "",
-      "🔥 **¿Por qué deberíamos aceptarte?:**",
-      String(answers.whyAccept || ""),
-      "",
-      "📜 *Juramento aceptado*"
-    ];
+        const channel = await guild.channels.fetch(channelId);
+        if (!channel || !channel.isTextBased()) {
+          console.error("Recruitment: channel not found or not text", { channelId });
+          return;
+        }
 
-    const content = lines.join("\n");
+        const lines = [
+          "🛡️ **Nueva Solicitud de Reclutamiento – Ataraxia**",
+          "",
+          `👤 **Discord:** ${discordTag || "Usuario"} (<@${discordUserId}>)`,
+          `🆔 **ID:** ${discordUserId}`,
+          "",
+          "**Respuestas:**",
+          `1️⃣ Gameplay: **${answers.gameplayType}**`,
+          `2️⃣ Días/semana: **${answers.daysPerWeek}**`,
+          `3️⃣ Perder loot por la guild: **${answers.loseLoot}**`,
+          `4️⃣ Ayudar a nuevos: **${answers.helpNewbies}**`,
+          `5️⃣ Acepta jerarquía: **${answers.acceptHierarchy}**`,
+          `6️⃣ Experiencia en guilds grandes: **${answers.bigGuilds}**`,
+          `7️⃣ Rol: **${answers.leaderOrExecutor}**`,
+          `8️⃣ Seguir órdenes en PvP masivo: **${answers.followOrdersMassPvp}**`,
+          "",
+          "🧠 **Si un líder se equivoca:**",
+          answers.badLeaderDecision,
+          "",
+          "🔥 **¿Por qué deberíamos aceptarte?:**",
+          answers.whyAccept,
+          "",
+          "📜 *Juramento aceptado*",
+        ];
 
-    const msg = await channel.send({ content });
-
-    return res.json({
-      ok: true,
-      messageId: msg.id
+        const msg = await channel.send({ content: lines.join("\n") });
+        console.log("Recruitment sent:", msg.id);
+      } catch (err) {
+        console.error("Recruitment BG error:", err);
+      }
     });
-
   } catch (err) {
     console.error("Recruitment error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Internal error"
-    });
+    return res.status(500).json({ ok: false, error: err.message || "Internal error" });
   }
 });
+
 
 // =======================
 // ENDPOINT PARA WIX (GENÉRICO): roles sync
