@@ -40,7 +40,6 @@ function auth(req, res, next) {
 
 // 1️⃣ Inicia OAuth
 app.get("/oauth/discord/start", (req, res) => {
-  // state simple (puedes hacerlo más pro luego)
   const state = "ATARAXIA_" + Date.now();
 
   const params = new URLSearchParams({
@@ -60,7 +59,6 @@ app.get("/oauth/discord/callback", async (req, res) => {
   if (!code) return res.status(400).send("No code");
 
   try {
-    // Intercambiar code → access_token
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -74,23 +72,15 @@ app.get("/oauth/discord/callback", async (req, res) => {
     });
 
     const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return res.status(401).send("OAuth token error");
 
-    if (!tokenData.access_token) {
-      return res.status(401).send("OAuth token error");
-    }
-
-    // Obtener usuario
     const userRes = await fetch("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
 
     const user = await userRes.json();
+    if (!user?.id) return res.status(500).send("Could not fetch user");
 
-    if (!user?.id) {
-      return res.status(500).send("Could not fetch user");
-    }
-
-    // ✅ Devuelve discordId al iFrame / Wix (ventana que abrió el popup)
     res.send(`
       <script>
         try{
@@ -131,10 +121,7 @@ app.post("/roles/sync", auth, async (req, res) => {
     return res.json({ ok: true, added: rolesAdd, removed: rolesRemove });
   } catch (err) {
     console.error("❌ Error en /roles/sync:", err);
-    return res.status(500).json({
-      ok: false,
-      error: String(err?.message || err),
-    });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -143,4 +130,3 @@ app.post("/roles/sync", auth, async (req, res) => {
 // =======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
-});
