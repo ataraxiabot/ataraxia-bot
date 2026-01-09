@@ -11,9 +11,10 @@ app.use(express.json());
 
 // =======================
 // MAPA RANGO (Wix) -> ROLE ID (Discord)  ✅ OPCIÓN A
+// (llaves NORMALIZADAS para que funcione con normRank)
 // =======================
 const RANGO_TO_ROLE = {
-  "esperando validación": "1459028408066506812",
+  "esperando validacion": "1459028408066506812",
   "aspirante":  "1226682948233990205",
   "miembro":    "1279577361922396281",
 };
@@ -42,11 +43,8 @@ client.once("ready", () => {
   console.log(`🤖 Bot conectado como ${client.user.tag}`);
 });
 
-// ✅ Login del bot
-await client.login(process.env.DISCORD_TOKEN);
-
 // =======================
-// SEGURIDAD BÁSICA
+// SEGURIDAD BÁSICA (Bearer BOT_API_KEY)
 // =======================
 function auth(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -121,8 +119,79 @@ app.get("/oauth/discord/callback", async (req, res) => {
   }
 });
 
+// =========================
+// RECLUTAMIENTO - POST A DISCORD
+// =========================
+app.post("/forms/recruitment", auth, async (req, res) => {
+  try {
+    const {
+      guildId,
+      channelId,
+      discordUserId,
+      discordTag,
+      answers
+    } = req.body || {};
+
+    if (!guildId || !channelId || !discordUserId || !answers) {
+      return res.status(400).json({ ok: false, error: "Missing fields" });
+    }
+
+    const guild = await client.guilds.fetch(guildId);
+    if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
+
+    const channel = await guild.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased()) {
+      return res.status(404).json({ ok: false, error: "Channel not found or not text" });
+    }
+
+    // 🧠 Construcción del mensaje (Discord tiene límite ~2000 chars)
+    // Si luego quieres, lo convertimos a embeds o lo recortamos automáticamente.
+    const lines = [
+      "🛡️ **Nueva Solicitud de Reclutamiento – Ataraxia**",
+      "",
+      `👤 **Discord:** ${discordTag || "Usuario"} (<@${discordUserId}>)`,
+      `🆔 **ID:** ${discordUserId}`,
+      "",
+      "**Respuestas:**",
+      `1️⃣ Gameplay: **${answers.gameplayType}**`,
+      `2️⃣ Días/semana: **${answers.daysPerWeek}**`,
+      `3️⃣ Perder loot por la guild: **${answers.loseLoot}**`,
+      `4️⃣ Ayudar a nuevos: **${answers.helpNewbies}**`,
+      `5️⃣ Acepta jerarquía: **${answers.acceptHierarchy}**`,
+      `6️⃣ Experiencia en guilds grandes: **${answers.bigGuilds}**`,
+      `7️⃣ Rol: **${answers.leaderOrExecutor}**`,
+      `8️⃣ Seguir órdenes en PvP masivo: **${answers.followOrdersMassPvp}**`,
+      "",
+      "🧠 **Si un líder se equivoca:**",
+      String(answers.badLeaderDecision || ""),
+      "",
+      "🔥 **¿Por qué deberíamos aceptarte?:**",
+      String(answers.whyAccept || ""),
+      "",
+      "📜 *Juramento aceptado*"
+    ];
+
+    const content = lines.join("\n");
+
+    const msg = await channel.send({ content });
+
+    return res.json({
+      ok: true,
+      messageId: msg.id
+    });
+
+  } catch (err) {
+    console.error("Recruitment error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Internal error"
+    });
+  }
+});
+
 // =======================
-// ENDPOINT PARA WIX (GENÉRICO)
+// ENDPOINT PARA WIX (GENÉRICO): roles sync
+// body: { guildId, discordUserId, rolesAdd[], rolesRemove[] }
 // =======================
 app.post("/roles/sync", auth, async (req, res) => {
   try {
@@ -152,7 +221,7 @@ app.post("/roles/sync", auth, async (req, res) => {
 });
 
 // =======================
-// ENDPOINT SIMPLE: set rank (Wix -> Discord)
+// ENDPOINT: set rank (Wix -> Discord)
 // body: { guildId, discordUserId, rango }
 // =======================
 app.post("/roles/set-rank", auth, async (req, res) => {
@@ -214,7 +283,16 @@ app.get("/", (req, res) => {
 });
 
 // =======================
-// START SERVER
+// BOOT (asegura que el bot conecte antes de escuchar)
 // =======================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
+async function boot(){
+  await client.login(process.env.DISCORD_TOKEN);
+
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
+}
+
+boot().catch((e) => {
+  console.error("❌ Boot error:", e);
+  process.exit(1);
+});
