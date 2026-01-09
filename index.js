@@ -141,7 +141,6 @@ app.post("/roles/sync", auth, async (req, res) => {
 // =======================
 // START SERVER
 // =======================
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`✅ API escuchando en puerto ${PORT}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
 });
