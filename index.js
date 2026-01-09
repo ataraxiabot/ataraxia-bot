@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import fetch from "node-fetch";
 import { Client, GatewayIntentBits } from "discord.js";
 
 // =======================
@@ -7,6 +8,28 @@ import { Client, GatewayIntentBits } from "discord.js";
 // =======================
 const app = express();
 app.use(express.json());
+
+// =======================
+// MAPA RANGO (Wix) -> ROLE ID (Discord)  ✅ OPCIÓN A
+// =======================
+const RANGO_TO_ROLE = {
+  "esperando validación": "1459028408066506812",
+  "aspirante":  "1226682948233990205",
+  "miembro":    "1279577361922396281",
+};
+
+function normRank(s){
+  return String(s || "")
+    .toLowerCase()
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")  // quita acentos
+    .replace(/\s+/g, " ");           // colapsa espacios
+}
+
+function roleIdFromRank(rango){
+  return RANGO_TO_ROLE[normRank(rango)] || null;
+}
 
 // =======================
 // DISCORD CLIENT
@@ -19,7 +42,7 @@ client.once("ready", () => {
   console.log(`🤖 Bot conectado como ${client.user.tag}`);
 });
 
-// Login del bot
+// ✅ Login del bot
 await client.login(process.env.DISCORD_TOKEN);
 
 // =======================
@@ -71,7 +94,7 @@ app.get("/oauth/discord/callback", async (req, res) => {
     });
 
     const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) return res.status(401).send("OAuth token error");
+    if (!tokenData?.access_token) return res.status(401).send("OAuth token error");
 
     const userRes = await fetch("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
@@ -80,14 +103,15 @@ app.get("/oauth/discord/callback", async (req, res) => {
     const user = await userRes.json();
     if (!user?.id) return res.status(500).send("Could not fetch user");
 
+    // ✅ Devuelve discordId al iFrame (window.opener)
     res.send(`
       <script>
-        try{
+        try {
           window.opener.postMessage(
             { type: "discord:ok", discordId: "${user.id}", username: "${user.username}" },
             "*"
           );
-        }catch(e){}
+        } catch(e) {}
         window.close();
       </script>
     `);
@@ -98,7 +122,7 @@ app.get("/oauth/discord/callback", async (req, res) => {
 });
 
 // =======================
-// ENDPOINT PARA WIX
+// ENDPOINT PARA WIX (GENÉRICO)
 // =======================
 app.post("/roles/sync", auth, async (req, res) => {
   try {
@@ -120,8 +144,73 @@ app.post("/roles/sync", auth, async (req, res) => {
     return res.json({ ok: true, added: rolesAdd, removed: rolesRemove });
   } catch (err) {
     console.error("❌ Error en /roles/sync:", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    });
   }
+});
+
+// =======================
+// ENDPOINT SIMPLE: set rank (Wix -> Discord)
+// body: { guildId, discordUserId, rango }
+// =======================
+app.post("/roles/set-rank", auth, async (req, res) => {
+  try {
+    const { guildId, discordUserId, rango } = req.body;
+
+    if (!guildId || !discordUserId || !rango) {
+      return res.status(400).json({
+        ok: false,
+        error: "guildId, discordUserId y rango son requeridos",
+      });
+    }
+
+    const targetRoleId = roleIdFromRank(rango);
+    if (!targetRoleId) {
+      return res.status(400).json({
+        ok: false,
+        error: `Rango no mapeado: ${String(rango)}`,
+      });
+    }
+
+    const guild = await client.guilds.fetch(guildId);
+    const member = await guild.members.fetch(discordUserId);
+
+    const systemRoleIds = new Set(Object.values(RANGO_TO_ROLE));
+
+    // Quitar cualquier rol del sistema distinto al target
+    const toRemove = member.roles.cache
+      .filter((r) => systemRoleIds.has(r.id) && r.id !== targetRoleId)
+      .map((r) => r.id);
+
+    if (toRemove.length) await member.roles.remove(toRemove);
+
+    // Agregar target si no lo tiene
+    if (!member.roles.cache.has(targetRoleId)) {
+      await member.roles.add([targetRoleId]);
+    }
+
+    return res.json({
+      ok: true,
+      rango: normRank(rango),
+      added: [targetRoleId],
+      removed: toRemove,
+    });
+  } catch (err) {
+    console.error("❌ Error en /roles/set-rank:", err);
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    });
+  }
+});
+
+// =======================
+// HEALTHCHECK
+// =======================
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "ataraxia-bot" });
 });
 
 // =======================
