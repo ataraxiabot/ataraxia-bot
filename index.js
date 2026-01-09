@@ -52,6 +52,9 @@ app.get("/oauth/discord/callback", async (req, res) => {
   if (!code) return res.status(400).send("No code");
 
   try {
+    // =========================
+    // Intercambio de token
+    // =========================
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -65,35 +68,56 @@ app.get("/oauth/discord/callback", async (req, res) => {
     });
 
     const tokenData = await tokenRes.json();
-    if (!tokenData?.access_token) return res.status(401).send("OAuth token error");
+    if (!tokenData?.access_token) {
+      return res.status(401).send("OAuth token error");
+    }
 
+    // =========================
+    // Obtener usuario Discord
+    // =========================
     const userRes = await fetch("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
 
     const user = await userRes.json();
-    if (!user?.id) return res.status(500).send("Could not fetch user");
+    if (!user?.id) {
+      return res.status(500).send("Could not fetch user");
+    }
 
-    // ✅ mandamos objeto completo al opener
-    // Nota: username/global_name/avatar/id
-    const safeUser = {
-      id: user.id,
-      username: user.username,
-      global_name: user.global_name || "",
-      avatar: user.avatar || "",
-    };
+    const discordId = String(user.id);
+    const username = String(user.global_name || user.username || "");
 
-    res.send(`
-      <script>
-        try {
-          window.opener.postMessage(
-            { type: "discord:ok", discordUser: ${JSON.stringify(safeUser)} },
-            "*"
-          );
-        } catch(e) {}
-        window.close();
-      </script>
-    `);
+    // =========================
+    // RESPUESTA AL POPUP (Opción A)
+    // =========================
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Discord vinculado</title>
+</head>
+<body>
+<script>
+(function () {
+  try {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage(
+        {
+          type: "discord:ok",
+          discordId: ${JSON.stringify(discordId)},
+          username: ${JSON.stringify(username)}
+        },
+        "*"
+      );
+    }
+  } catch (e) {}
+  window.close();
+})();
+</script>
+<p>Discord vinculado. Puedes cerrar esta ventana.</p>
+</body>
+</html>`);
   } catch (err) {
     console.error("OAuth error:", err);
     res.status(500).send("OAuth error");
@@ -102,6 +126,7 @@ app.get("/oauth/discord/callback", async (req, res) => {
 
 // =========================
 // RECLUTAMIENTO - POST A DISCORD
+// (NO SE TOCA)
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
@@ -119,22 +144,22 @@ app.post("/forms/recruitment", auth, async (req, res) => {
     }
 
     console.log("📨 Recruitment IN:", {
-      guildId, channelId, discordUserId,
+      guildId,
+      channelId,
+      discordUserId,
       discordTag: discordTag || null,
       memberId: memberId || null
     });
 
     const guild = await client.guilds.fetch(guildId);
-    if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
+    if (!guild) {
+      return res.status(404).json({ ok: false, error: "Guild not found" });
+    }
 
-    // ✅ fetch directo por id
     const channel = await client.channels.fetch(channelId);
     if (!channel || !channel.isTextBased()) {
       return res.status(404).json({ ok: false, error: "Channel not found or not text" });
     }
-
-    // (opcional) validar permisos básicos si quieres
-    // si el canal es privado y el bot no está autorizado, aquí explotará con Missing Access
 
     const lines = [
       "🛡️ **Nueva Solicitud de Reclutamiento – Ataraxia**",
@@ -191,4 +216,6 @@ app.get("/", (req, res) => {
 // START SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
+app.listen(PORT, () => {
+  console.log("✅ API escuchando en puerto", PORT);
+});
