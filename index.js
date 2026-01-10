@@ -17,6 +17,7 @@ client.once("ready", () => {
   console.log(`🤖 Bot conectado como ${client.user.tag}`);
 });
 
+// Render (Node ESM) permite top-level await
 await client.login(process.env.DISCORD_TOKEN);
 
 // =======================
@@ -52,9 +53,6 @@ app.get("/oauth/discord/callback", async (req, res) => {
   if (!code) return res.status(400).send("No code");
 
   try {
-    // =========================
-    // Intercambio de token
-    // =========================
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -68,56 +66,34 @@ app.get("/oauth/discord/callback", async (req, res) => {
     });
 
     const tokenData = await tokenRes.json();
-    if (!tokenData?.access_token) {
-      return res.status(401).send("OAuth token error");
-    }
+    if (!tokenData?.access_token) return res.status(401).send("OAuth token error");
 
-    // =========================
-    // Obtener usuario Discord
-    // =========================
     const userRes = await fetch("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
 
     const user = await userRes.json();
-    if (!user?.id) {
-      return res.status(500).send("Could not fetch user");
-    }
+    if (!user?.id) return res.status(500).send("Could not fetch user");
 
-    const discordId = String(user.id);
-    const username = String(user.global_name || user.username || "");
+    // ✅ mandamos objeto completo al opener
+    const safeUser = {
+      id: user.id,
+      username: user.username,
+      global_name: user.global_name || "",
+      avatar: user.avatar || "",
+    };
 
-    // =========================
-    // RESPUESTA AL POPUP (Opción A)
-    // =========================
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8" />
-  <title>Discord vinculado</title>
-</head>
-<body>
-<script>
-(function () {
-  try {
-    if (window.opener && !window.opener.closed) {
-      window.opener.postMessage(
-        {
-          type: "discord:ok",
-          discordId: ${JSON.stringify(discordId)},
-          username: ${JSON.stringify(username)}
-        },
-        "*"
-      );
-    }
-  } catch (e) {}
-  window.close();
-})();
-</script>
-<p>Discord vinculado. Puedes cerrar esta ventana.</p>
-</body>
-</html>`);
+    res.send(`
+      <script>
+        try {
+          window.opener.postMessage(
+            { type: "discord:ok", discordUser: ${JSON.stringify(safeUser)} },
+            "*"
+          );
+        } catch(e) {}
+        window.close();
+      </script>
+    `);
   } catch (err) {
     console.error("OAuth error:", err);
     res.status(500).send("OAuth error");
@@ -125,8 +101,55 @@ app.get("/oauth/discord/callback", async (req, res) => {
 });
 
 // =========================
+// ROLES SYNC (Wix -> Render)
+// Endpoint esperado por Wix: POST /roles/sync
+// =========================
+app.post("/roles/sync", auth, async (req, res) => {
+  try {
+    const { guildId, discordUserId, rolesAdd = [], rolesRemove = [] } = req.body || {};
+
+    if (!guildId || !discordUserId) {
+      return res.status(400).json({ ok: false, error: "Missing guildId/discordUserId" });
+    }
+
+    const gid = String(guildId);
+    const uid = String(discordUserId);
+
+    const guild = await client.guilds.fetch(gid);
+    if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
+
+    const member = await guild.members.fetch(uid).catch(() => null);
+    if (!member) {
+      return res.status(404).json({
+        ok: false,
+        error: "Member not found in guild (user must be in the server)"
+      });
+    }
+
+    const add = Array.isArray(rolesAdd) ? rolesAdd.map(String).filter(Boolean) : [];
+    const rem = Array.isArray(rolesRemove) ? rolesRemove.map(String).filter(Boolean) : [];
+
+    // Quitamos primero, luego agregamos
+    if (rem.length) await member.roles.remove(rem);
+    if (add.length) await member.roles.add(add);
+
+    return res.json({
+      ok: true,
+      guildId: gid,
+      discordUserId: uid,
+      rolesAdd: add,
+      rolesRemove: rem
+    });
+
+  } catch (err) {
+    console.error("❌ roles/sync error:", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// =========================
 // RECLUTAMIENTO - POST A DISCORD
-// (NO SE TOCA)
+// (queda IGUAL, no se rompe)
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
@@ -144,17 +167,13 @@ app.post("/forms/recruitment", auth, async (req, res) => {
     }
 
     console.log("📨 Recruitment IN:", {
-      guildId,
-      channelId,
-      discordUserId,
+      guildId, channelId, discordUserId,
       discordTag: discordTag || null,
       memberId: memberId || null
     });
 
     const guild = await client.guilds.fetch(guildId);
-    if (!guild) {
-      return res.status(404).json({ ok: false, error: "Guild not found" });
-    }
+    if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
 
     const channel = await client.channels.fetch(channelId);
     if (!channel || !channel.isTextBased()) {
@@ -216,6 +235,4 @@ app.get("/", (req, res) => {
 // START SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("✅ API escuchando en puerto", PORT);
-});
+app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
