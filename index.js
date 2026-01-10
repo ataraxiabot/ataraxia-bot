@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
+import crypto from "crypto";
 import { Client, GatewayIntentBits } from "discord.js";
 
 const app = express();
@@ -17,11 +18,10 @@ client.once("ready", () => {
   console.log(`🤖 Bot conectado como ${client.user.tag}`);
 });
 
-// Render (Node ESM) permite top-level await
 await client.login(process.env.DISCORD_TOKEN);
 
 // =======================
-// SEGURIDAD BÁSICA
+// SEGURIDAD BÁSICA (Wix -> Render)
 // =======================
 function auth(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -32,20 +32,41 @@ function auth(req, res, next) {
 }
 
 // =========================
-// DISCORD OAUTH (WIX FLOW)
+// DISCORD OAUTH (WIX FLOW) - IMPERIAL
 // =========================
 const WIX_RETURN_URL =
   process.env.WIX_RETURN_URL ||
   "https://www.comunidad-ataraxia.com/registro-nuevos-miembros";
 
-function buildWixReturnUrl(user) {
+const OAUTH_HMAC_SECRET = process.env.OAUTH_HMAC_SECRET || "";
+
+/**
+ * Firma HMAC SHA256 en hex (simple y estable).
+ * stringToSign = `${state}.${ts}.${discordId}`
+ */
+function signDiscordReturn({ state, ts, discordId }) {
+  if (!OAUTH_HMAC_SECRET) return "";
+  const stringToSign = `${state}.${ts}.${discordId}`;
+  return crypto.createHmac("sha256", OAUTH_HMAC_SECRET).update(stringToSign).digest("hex");
+}
+
+function buildWixReturnUrl({ user, state }) {
+  const ts = String(Date.now());
+  const sig = signDiscordReturn({ state, ts, discordId: String(user.id || "") });
+
   const params = new URLSearchParams({
-    discord_ok: "1",
+    // ✅ lo que Wix necesita para hidratar + verificar
     discordId: String(user.id || ""),
     username: String(user.username || ""),
     global_name: String(user.global_name || ""),
-    avatar: String(user.avatar || "")
+    avatar: String(user.avatar || ""),
+
+    // ✅ imperial proof inputs
+    state: String(state || ""),
+    ts,
+    sig,
   });
+
   return `${WIX_RETURN_URL}?${params.toString()}`;
 }
 
@@ -57,17 +78,18 @@ app.get("/oauth/discord/start", (req, res) => {
     redirect_uri: process.env.DISCORD_REDIRECT_URI,
     response_type: "code",
     scope: "identify",
-    state
+    state,
   });
 
-  return res.redirect(
-    "https://discord.com/oauth2/authorize?" + params.toString()
-  );
+  return res.redirect("https://discord.com/oauth2/authorize?" + params.toString());
 });
 
 app.get("/oauth/discord/callback", async (req, res) => {
-  const code = req.query.code;
+  const code = String(req.query.code || "").trim();
+  const state = String(req.query.state || "").trim();
+
   if (!code) return res.status(400).send("No code");
+  if (!state) return res.status(400).send("No state");
 
   try {
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
@@ -77,9 +99,9 @@ app.get("/oauth/discord/callback", async (req, res) => {
         client_id: process.env.DISCORD_CLIENT_ID,
         client_secret: process.env.DISCORD_CLIENT_SECRET,
         grant_type: "authorization_code",
-        code: String(code),
-        redirect_uri: process.env.DISCORD_REDIRECT_URI
-      })
+        code,
+        redirect_uri: process.env.DISCORD_REDIRECT_URI,
+      }),
     });
 
     const tokenData = await tokenRes.json();
@@ -89,11 +111,12 @@ app.get("/oauth/discord/callback", async (req, res) => {
     }
 
     const userRes = await fetch("https://discord.com/api/users/@me", {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
 
     const user = await userRes.json();
     if (!user?.id) {
+      console.error("Could not fetch user:", user);
       return res.status(500).send("Could not fetch Discord user");
     }
 
@@ -101,11 +124,11 @@ app.get("/oauth/discord/callback", async (req, res) => {
       id: user.id,
       username: user.username || "",
       global_name: user.global_name || "",
-      avatar: user.avatar || ""
+      avatar: user.avatar || "",
     };
 
-    // ✅ Redirect limpio de regreso a Wix
-    return res.redirect(buildWixReturnUrl(safeUser));
+    // ✅ Redirect limpio de regreso a Wix, con state/ts/sig
+    return res.redirect(buildWixReturnUrl({ user: safeUser, state }));
 
   } catch (err) {
     console.error("OAuth error:", err);
@@ -129,10 +152,7 @@ app.post("/roles/sync", auth, async (req, res) => {
 
     const member = await guild.members.fetch(String(discordUserId)).catch(() => null);
     if (!member) {
-      return res.status(404).json({
-        ok: false,
-        error: "Member not found in guild"
-      });
+      return res.status(404).json({ ok: false, error: "Member not found in guild" });
     }
 
     const add = Array.isArray(rolesAdd) ? rolesAdd.map(String).filter(Boolean) : [];
@@ -141,14 +161,7 @@ app.post("/roles/sync", auth, async (req, res) => {
     if (rem.length) await member.roles.remove(rem);
     if (add.length) await member.roles.add(add);
 
-    return res.json({
-      ok: true,
-      guildId,
-      discordUserId,
-      rolesAdd: add,
-      rolesRemove: rem
-    });
-
+    return res.json({ ok: true, guildId, discordUserId, rolesAdd: add, rolesRemove: rem });
   } catch (err) {
     console.error("❌ roles/sync error:", err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
@@ -160,21 +173,11 @@ app.post("/roles/sync", auth, async (req, res) => {
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
-    const {
-      guildId,
-      channelId,
-      discordUserId,
-      discordTag,
-      answers,
-      memberId
-    } = req.body || {};
+    const { guildId, channelId, discordUserId, discordTag, answers, memberId } = req.body || {};
 
     if (!guildId || !channelId || !discordUserId || !answers) {
       return res.status(400).json({ ok: false, error: "Missing fields" });
     }
-
-    const guild = await client.guilds.fetch(String(guildId));
-    if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
 
     const channel = await client.channels.fetch(String(channelId));
     if (!channel || !channel.isTextBased()) {
@@ -204,13 +207,11 @@ app.post("/forms/recruitment", auth, async (req, res) => {
       "🔥 **10) ¿Por qué deberíamos aceptarte?:**",
       answers.whyAccept,
       "",
-      "📜 *Juramento aceptado*"
+      "📜 *Juramento aceptado*",
     ].filter(Boolean);
 
     const msg = await channel.send({ content: lines.join("\n") });
-
     return res.json({ ok: true, messageId: msg.id });
-
   } catch (err) {
     console.error("❌ Recruitment error:", err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
@@ -228,6 +229,4 @@ app.get("/", (req, res) => {
 // START SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log("✅ API escuchando en puerto", PORT)
-);
+app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
