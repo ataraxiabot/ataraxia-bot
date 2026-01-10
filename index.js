@@ -32,8 +32,23 @@ function auth(req, res, next) {
 }
 
 // =========================
-// DISCORD OAUTH
+// DISCORD OAUTH (WIX FLOW)
 // =========================
+const WIX_RETURN_URL =
+  process.env.WIX_RETURN_URL ||
+  "https://www.comunidad-ataraxia.com/registro-nuevos-miembros";
+
+function buildWixReturnUrl(user) {
+  const params = new URLSearchParams({
+    discord_ok: "1",
+    discordId: String(user.id || ""),
+    username: String(user.username || ""),
+    global_name: String(user.global_name || ""),
+    avatar: String(user.avatar || "")
+  });
+  return `${WIX_RETURN_URL}?${params.toString()}`;
+}
+
 app.get("/oauth/discord/start", (req, res) => {
   const state = "ATARAXIA_" + Date.now();
 
@@ -42,10 +57,12 @@ app.get("/oauth/discord/start", (req, res) => {
     redirect_uri: process.env.DISCORD_REDIRECT_URI,
     response_type: "code",
     scope: "identify",
-    state,
+    state
   });
 
-  res.redirect("https://discord.com/oauth2/authorize?" + params.toString());
+  return res.redirect(
+    "https://discord.com/oauth2/authorize?" + params.toString()
+  );
 });
 
 app.get("/oauth/discord/callback", async (req, res) => {
@@ -60,53 +77,44 @@ app.get("/oauth/discord/callback", async (req, res) => {
         client_id: process.env.DISCORD_CLIENT_ID,
         client_secret: process.env.DISCORD_CLIENT_SECRET,
         grant_type: "authorization_code",
-        code,
-        redirect_uri: process.env.DISCORD_REDIRECT_URI,
-      }),
+        code: String(code),
+        redirect_uri: process.env.DISCORD_REDIRECT_URI
+      })
     });
 
     const tokenData = await tokenRes.json();
-    if (!tokenData?.access_token) return res.status(401).send("OAuth token error");
+    if (!tokenData?.access_token) {
+      console.error("OAuth token error:", tokenData);
+      return res.status(401).send("OAuth token error");
+    }
 
     const userRes = await fetch("https://discord.com/api/users/@me", {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
     });
 
     const user = await userRes.json();
-    if (!user?.id) return res.status(500).send("Could not fetch user");
+    if (!user?.id) {
+      return res.status(500).send("Could not fetch Discord user");
+    }
 
-    // ✅ mandamos objeto completo al opener
     const safeUser = {
       id: user.id,
-      username: user.username,
+      username: user.username || "",
       global_name: user.global_name || "",
-      avatar: user.avatar || "",
+      avatar: user.avatar || ""
     };
 
-    res.send(`
-      <script>
-        try {
-          window.opener.postMessage(
-  {
-    type: "discord:ok",
-    discordId: "${safeUser.id}",
-    username: "${safeUser.username}"
-  },
-  "*"
-);
-        } catch(e) {}
-        window.close();
-      </script>
-    `);
+    // ✅ Redirect limpio de regreso a Wix
+    return res.redirect(buildWixReturnUrl(safeUser));
+
   } catch (err) {
     console.error("OAuth error:", err);
-    res.status(500).send("OAuth error");
+    return res.status(500).send("OAuth error");
   }
 });
 
 // =========================
 // ROLES SYNC (Wix -> Render)
-// Endpoint esperado por Wix: POST /roles/sync
 // =========================
 app.post("/roles/sync", auth, async (req, res) => {
   try {
@@ -116,31 +124,27 @@ app.post("/roles/sync", auth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing guildId/discordUserId" });
     }
 
-    const gid = String(guildId);
-    const uid = String(discordUserId);
-
-    const guild = await client.guilds.fetch(gid);
+    const guild = await client.guilds.fetch(String(guildId));
     if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
 
-    const member = await guild.members.fetch(uid).catch(() => null);
+    const member = await guild.members.fetch(String(discordUserId)).catch(() => null);
     if (!member) {
       return res.status(404).json({
         ok: false,
-        error: "Member not found in guild (user must be in the server)"
+        error: "Member not found in guild"
       });
     }
 
     const add = Array.isArray(rolesAdd) ? rolesAdd.map(String).filter(Boolean) : [];
     const rem = Array.isArray(rolesRemove) ? rolesRemove.map(String).filter(Boolean) : [];
 
-    // Quitamos primero, luego agregamos
     if (rem.length) await member.roles.remove(rem);
     if (add.length) await member.roles.add(add);
 
     return res.json({
       ok: true,
-      guildId: gid,
-      discordUserId: uid,
+      guildId,
+      discordUserId,
       rolesAdd: add,
       rolesRemove: rem
     });
@@ -153,7 +157,6 @@ app.post("/roles/sync", auth, async (req, res) => {
 
 // =========================
 // RECLUTAMIENTO - POST A DISCORD
-// (queda IGUAL, no se rompe)
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
@@ -170,16 +173,10 @@ app.post("/forms/recruitment", auth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing fields" });
     }
 
-    console.log("📨 Recruitment IN:", {
-      guildId, channelId, discordUserId,
-      discordTag: discordTag || null,
-      memberId: memberId || null
-    });
-
-    const guild = await client.guilds.fetch(guildId);
+    const guild = await client.guilds.fetch(String(guildId));
     if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
 
-    const channel = await client.channels.fetch(channelId);
+    const channel = await client.channels.fetch(String(channelId));
     if (!channel || !channel.isTextBased()) {
       return res.status(404).json({ ok: false, error: "Channel not found or not text" });
     }
@@ -212,19 +209,11 @@ app.post("/forms/recruitment", auth, async (req, res) => {
 
     const msg = await channel.send({ content: lines.join("\n") });
 
-    console.log("✅ Recruitment posted:", {
-      channelId,
-      messageId: msg.id
-    });
-
     return res.json({ ok: true, messageId: msg.id });
 
   } catch (err) {
     console.error("❌ Recruitment error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: String(err?.message || err),
-    });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -239,4 +228,6 @@ app.get("/", (req, res) => {
 // START SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
+app.listen(PORT, () =>
+  console.log("✅ API escuchando en puerto", PORT)
+);
