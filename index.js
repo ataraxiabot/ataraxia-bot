@@ -32,13 +32,8 @@ function auth(req, res, next) {
 }
 
 // =========================
-// DISCORD OAUTH (WIX FLOW) - IMPERIAL ✅ FULL FIX
+// DISCORD OAUTH (POPUP FLOW) - IMPERIAL
 // =========================
-const WIX_RETURN_URL =
-  process.env.WIX_RETURN_URL ||
-  "https://www.comunidad-ataraxia.com/registro-nuevos-miembros";
-
-// Debe coincidir con Wix secret: IMPERIAL_OAUTH_HMAC_SECRET
 const OAUTH_HMAC_SECRET = process.env.OAUTH_HMAC_SECRET || "";
 
 function nowSec() {
@@ -46,13 +41,11 @@ function nowSec() {
 }
 
 /**
- * ✅ Firma HMAC SHA256 hex con el MISMO canonical message que Wix verifica:
- * Wix arma:
- *   ["ATARAXIA_OAUTH_V1", did, username, global_name, String(ts), state].join("|")
+ * Canonical message DEBE coincidir con Wix:
+ * ["ATARAXIA_OAUTH_V1", did, username, global_name, String(ts), state].join("|")
  */
-function signDiscordReturn({ discordId, username, global_name, ts, state }) {
+function signImperial({ discordId, username, global_name, ts, state }) {
   if (!OAUTH_HMAC_SECRET) return "";
-
   const msg = [
     "ATARAXIA_OAUTH_V1",
     String(discordId || ""),
@@ -61,42 +54,19 @@ function signDiscordReturn({ discordId, username, global_name, ts, state }) {
     String(ts || ""),
     String(state || ""),
   ].join("|");
-
   return crypto.createHmac("sha256", OAUTH_HMAC_SECRET).update(msg, "utf8").digest("hex");
 }
 
-function buildWixReturnUrl({ user, state }) {
-  const ts = String(nowSec()); // ✅ segundos (Wix usa nowSec())
-
-  const sig = signDiscordReturn({
-    discordId: String(user.id || ""),
-    username: String(user.username || ""),
-    global_name: String(user.global_name || ""),
-    ts,
-    state: String(state || ""),
-  });
-
-  const params = new URLSearchParams({
-    // ✅ tu frontend Wix hidrata con esto
-    discord_ok: "1",
-
-    // ✅ identidad
-    discordId: String(user.id || ""),
-    username: String(user.username || ""),
-    global_name: String(user.global_name || ""),
-    avatar: String(user.avatar || ""),
-
-    // ✅ inputs para verify imperial en Wix
-    state: String(state || ""),
-    ts,
-    sig,
-  });
-
-  return `${WIX_RETURN_URL}?${params.toString()}`;
+function escapeJs(s) {
+  return String(s || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/`/g, "\\`")
+    .replace(/\$/g, "\\$")
+    .replace(/<\/script>/gi, "<\\/script>");
 }
 
 app.get("/oauth/discord/start", (req, res) => {
-  const state = "ATARAXIA_" + Date.now(); // ok (string estable)
+  const state = "ATARAXIA_" + Date.now();
 
   const params = new URLSearchParams({
     client_id: process.env.DISCORD_CLIENT_ID,
@@ -146,14 +116,54 @@ app.get("/oauth/discord/callback", async (req, res) => {
     }
 
     const safeUser = {
-      id: user.id,
-      username: user.username || "",
-      global_name: user.global_name || "",
-      avatar: user.avatar || "",
+      id: String(user.id || ""),
+      username: String(user.username || ""),
+      global_name: String(user.global_name || ""),
+      avatar: String(user.avatar || ""),
     };
 
-    // ✅ redirige a Wix con discord_ok=1 + state/ts/sig válidos para tu backend wix imperial
-    return res.redirect(buildWixReturnUrl({ user: safeUser, state }));
+    const ts = String(nowSec()); // ✅ segundos
+    const sig = signImperial({
+      discordId: safeUser.id,
+      username: safeUser.username,
+      global_name: safeUser.global_name,
+      ts,
+      state,
+    });
+
+    // ✅ devolvemos HTML que postMessagea al opener (iframe) y cierra popup
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.send(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Discord OAuth</title></head>
+<body style="font-family:system-ui;padding:18px;">
+  <p>✅ Autorización completada. Puedes cerrar esta ventana.</p>
+  <script>
+    (function(){
+      try{
+        var payload = {
+          type: "discord:ok",
+          discord: {
+            id: "${escapeJs(safeUser.id)}",
+            username: "${escapeJs(safeUser.username)}",
+            global_name: "${escapeJs(safeUser.global_name)}",
+            avatar: "${escapeJs(safeUser.avatar)}"
+          },
+          imperial: {
+            state: "${escapeJs(state)}",
+            ts: "${escapeJs(ts)}",
+            sig: "${escapeJs(sig)}"
+          }
+        };
+        if (window.opener && window.opener.postMessage) {
+          window.opener.postMessage(payload, "*");
+        }
+      } catch(e){}
+      try{ window.close(); } catch(e){}
+    })();
+  </script>
+</body>
+</html>`);
   } catch (err) {
     console.error("OAuth error:", err);
     return res.status(500).send("OAuth error");
@@ -175,9 +185,7 @@ app.post("/roles/sync", auth, async (req, res) => {
     if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
 
     const member = await guild.members.fetch(String(discordUserId)).catch(() => null);
-    if (!member) {
-      return res.status(404).json({ ok: false, error: "Member not found in guild" });
-    }
+    if (!member) return res.status(404).json({ ok: false, error: "Member not found in guild" });
 
     const add = Array.isArray(rolesAdd) ? rolesAdd.map(String).filter(Boolean) : [];
     const rem = Array.isArray(rolesRemove) ? rolesRemove.map(String).filter(Boolean) : [];
