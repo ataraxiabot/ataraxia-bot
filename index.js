@@ -32,36 +32,61 @@ function auth(req, res, next) {
 }
 
 // =========================
-// DISCORD OAUTH (WIX FLOW) - IMPERIAL
+// DISCORD OAUTH (WIX FLOW) - IMPERIAL ✅ FULL FIX
 // =========================
 const WIX_RETURN_URL =
   process.env.WIX_RETURN_URL ||
   "https://www.comunidad-ataraxia.com/registro-nuevos-miembros";
 
+// Debe coincidir con Wix secret: IMPERIAL_OAUTH_HMAC_SECRET
 const OAUTH_HMAC_SECRET = process.env.OAUTH_HMAC_SECRET || "";
 
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+
 /**
- * Firma HMAC SHA256 en hex (simple y estable).
- * stringToSign = `${state}.${ts}.${discordId}`
+ * ✅ Firma HMAC SHA256 hex con el MISMO canonical message que Wix verifica:
+ * Wix arma:
+ *   ["ATARAXIA_OAUTH_V1", did, username, global_name, String(ts), state].join("|")
  */
-function signDiscordReturn({ state, ts, discordId }) {
+function signDiscordReturn({ discordId, username, global_name, ts, state }) {
   if (!OAUTH_HMAC_SECRET) return "";
-  const stringToSign = `${state}.${ts}.${discordId}`;
-  return crypto.createHmac("sha256", OAUTH_HMAC_SECRET).update(stringToSign).digest("hex");
+
+  const msg = [
+    "ATARAXIA_OAUTH_V1",
+    String(discordId || ""),
+    String(username || ""),
+    String(global_name || ""),
+    String(ts || ""),
+    String(state || ""),
+  ].join("|");
+
+  return crypto.createHmac("sha256", OAUTH_HMAC_SECRET).update(msg, "utf8").digest("hex");
 }
 
 function buildWixReturnUrl({ user, state }) {
-  const ts = String(Date.now());
-  const sig = signDiscordReturn({ state, ts, discordId: String(user.id || "") });
+  const ts = String(nowSec()); // ✅ segundos (Wix usa nowSec())
+
+  const sig = signDiscordReturn({
+    discordId: String(user.id || ""),
+    username: String(user.username || ""),
+    global_name: String(user.global_name || ""),
+    ts,
+    state: String(state || ""),
+  });
 
   const params = new URLSearchParams({
-    // ✅ lo que Wix necesita para hidratar + verificar
+    // ✅ tu frontend Wix hidrata con esto
+    discord_ok: "1",
+
+    // ✅ identidad
     discordId: String(user.id || ""),
     username: String(user.username || ""),
     global_name: String(user.global_name || ""),
     avatar: String(user.avatar || ""),
 
-    // ✅ imperial proof inputs
+    // ✅ inputs para verify imperial en Wix
     state: String(state || ""),
     ts,
     sig,
@@ -71,7 +96,7 @@ function buildWixReturnUrl({ user, state }) {
 }
 
 app.get("/oauth/discord/start", (req, res) => {
-  const state = "ATARAXIA_" + Date.now();
+  const state = "ATARAXIA_" + Date.now(); // ok (string estable)
 
   const params = new URLSearchParams({
     client_id: process.env.DISCORD_CLIENT_ID,
@@ -127,9 +152,8 @@ app.get("/oauth/discord/callback", async (req, res) => {
       avatar: user.avatar || "",
     };
 
-    // ✅ Redirect limpio de regreso a Wix, con state/ts/sig
+    // ✅ redirige a Wix con discord_ok=1 + state/ts/sig válidos para tu backend wix imperial
     return res.redirect(buildWixReturnUrl({ user: safeUser, state }));
-
   } catch (err) {
     console.error("OAuth error:", err);
     return res.status(500).send("OAuth error");
