@@ -87,9 +87,13 @@ app.get("/oauth/discord/callback", async (req, res) => {
       <script>
         try {
           window.opener.postMessage(
-            { type: "discord:ok", discordUser: ${JSON.stringify(safeUser)} },
-            "*"
-          );
+  {
+    type: "discord:ok",
+    discordId: "${safeUser.id}",
+    username: "${safeUser.username}"
+  },
+  "*"
+);
         } catch(e) {}
         window.close();
       </script>
