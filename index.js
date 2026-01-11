@@ -40,19 +40,15 @@ function mustEnv(name, v) {
 }
 
 // =========================
-// DISCORD OAUTH (SIMPLE)
-// - El iFrame abre popup a /oauth/discord/start
-// - Render hace callback y termina en /oauth/discord/complete
-// - /complete manda:
-//    window.opener.postMessage({
-//      type:"discord:ok",
-//      discordId, username, global_name, avatar
-//    }, "*");
+// DISCORD OAUTH (WIX-SAFE)
+// - iFrame pide OPEN_DISCORD_OAUTH
+// - Page Code hace wixLocation.to(/oauth/discord/start?returnUrl=...)
+// - Render -> Discord -> callback -> regresa a returnUrl con query
 // =========================
 
-// Anti-CSRF básico por state (en memoria) con TTL
 const STATE_TTL_MS = 10 * 60 * 1000;
-const stateStore = new Map(); // state -> createdAt
+const stateStore = new Map();       // state -> createdAt
+const returnUrlStore = new Map();   // state -> returnUrl
 
 function newState() {
   const s = crypto.randomBytes(18).toString("hex");
@@ -67,11 +63,15 @@ function consumeState(state) {
   return (Date.now() - t) <= STATE_TTL_MS;
 }
 
-// Opcional: limpieza periódica por si acaso
+// Cleanup in case
 setInterval(() => {
   const now = Date.now();
   for (const [k, t] of stateStore.entries()) {
     if (now - t > STATE_TTL_MS) stateStore.delete(k);
+  }
+  for (const [k, u] of returnUrlStore.entries()) {
+    // si no existe state, limpiamos returnUrl también
+    if (!stateStore.has(k)) returnUrlStore.delete(k);
   }
 }, 60_000).unref?.();
 
@@ -81,6 +81,13 @@ app.get("/oauth/discord/start", (req, res) => {
     mustEnv("DISCORD_REDIRECT_URI", process.env.DISCORD_REDIRECT_URI);
 
     const state = newState();
+
+    const returnUrl = String(req.query.returnUrl || "").trim();
+    if (returnUrl) {
+      // guardamos returnUrl ligado a state (anti-CSRF real)
+      returnUrlStore.set(state, returnUrl);
+    }
+
     const params = new URLSearchParams({
       client_id: process.env.DISCORD_CLIENT_ID,
       redirect_uri: process.env.DISCORD_REDIRECT_URI,
@@ -104,7 +111,6 @@ app.get("/oauth/discord/callback", async (req, res) => {
   if (!code) return res.status(400).send("No code");
   if (!state) return res.status(400).send("No state");
 
-  // ✅ valida state (anti-CSRF)
   if (!consumeState(state)) {
     return res.status(401).send("Invalid/expired state");
   }
@@ -114,7 +120,6 @@ app.get("/oauth/discord/callback", async (req, res) => {
     mustEnv("DISCORD_CLIENT_SECRET", process.env.DISCORD_CLIENT_SECRET);
     mustEnv("DISCORD_REDIRECT_URI", process.env.DISCORD_REDIRECT_URI);
 
-    // Intercambio code -> access_token
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -133,7 +138,6 @@ app.get("/oauth/discord/callback", async (req, res) => {
       return res.status(401).send("OAuth token error");
     }
 
-    // fetch user
     const userRes = await fetch("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
@@ -151,65 +155,25 @@ app.get("/oauth/discord/callback", async (req, res) => {
       avatar: String(user.avatar || ""),
     };
 
-    // Redirect a página de completion en Render (misma app)
-    const params = new URLSearchParams({
+    const returnUrl =
+      String(returnUrlStore.get(state) || "").trim() ||
+      "https://www.comunidad-ataraxia.com/registro-nuevos-miembros";
+
+    returnUrlStore.delete(state);
+
+    const p = new URLSearchParams({
+      oauth: "ok",
       discordId: safe.discordId,
       username: safe.username,
       global_name: safe.global_name,
       avatar: safe.avatar,
     });
 
-    return res.redirect(`/oauth/discord/complete?${params.toString()}`);
+    return res.redirect(`${returnUrl}${returnUrl.includes("?") ? "&" : "?"}${p.toString()}`);
   } catch (err) {
     console.error("OAuth callback error:", err);
     return res.status(500).send("OAuth error");
   }
-});
-
-// Página de completion: postMessage al opener y cierra
-app.get("/oauth/discord/complete", (req, res) => {
-  const q = {
-    discordId: String(req.query.discordId || "").trim(),
-    username: String(req.query.username || "").trim(),
-    global_name: String(req.query.global_name || "").trim(),
-    avatar: String(req.query.avatar || "").trim(),
-  };
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  return res.end(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Discord linked</title>
-</head>
-<body style="font-family:system-ui;background:#0b1020;color:#eaf0ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-  <div style="text-align:center;max-width:520px;padding:20px;">
-    <h2 style="margin:0 0 10px 0;">✅ Discord vinculado</h2>
-    <p style="opacity:.75;margin:0 0 14px 0;">Puedes cerrar esta ventana. Regresando al formulario…</p>
-
-    <script>
-      (function(){
-        var payload = {
-          type: "discord:ok",
-          discordId: ${JSON.stringify(q.discordId)},
-          username: ${JSON.stringify(q.username)},
-          global_name: ${JSON.stringify(q.global_name)},
-          avatar: ${JSON.stringify(q.avatar)}
-        };
-
-        try {
-          if (window.opener && !window.opener.closed) {
-            window.opener.postMessage(payload, "*");
-          }
-        } catch (e) {}
-
-        setTimeout(function(){ try { window.close(); } catch(e) {} }, 180);
-      })();
-    </script>
-  </div>
-</body>
-</html>`);
 });
 
 // =========================
@@ -244,7 +208,6 @@ app.post("/roles/sync", auth, async (req, res) => {
 
 // =========================
 // RECLUTAMIENTO - POST A DISCORD
-// (sin bundle imperial; ya confías en auth + discordUserId que trae Wix/iframe)
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
@@ -259,11 +222,7 @@ app.post("/forms/recruitment", auth, async (req, res) => {
       return res.status(404).json({ ok: false, error: "Channel not found or not text" });
     }
 
-    // Oath
-    const oathAccepted = !!answers.oathAccepted;
-    const oathText = String(answers.oathText || "").trim();
-
-    if (!oathAccepted) {
+    if (!answers?.oathAccepted) {
       return res.status(400).json({ ok: false, error: "Oath not accepted" });
     }
 
@@ -291,7 +250,7 @@ app.post("/forms/recruitment", auth, async (req, res) => {
       String(answers.whyAccept || "—"),
       "",
       "📜 **Juramento:**",
-      oathText ? `✅ ${oathText}` : "✅ Juramento aceptado",
+      `✅ ${String(answers.oathText || "Juramento aceptado").trim()}`,
     ].filter(Boolean);
 
     const msg = await channel.send({ content: lines.join("\n") });
@@ -309,8 +268,5 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "ataraxia-bot" });
 });
 
-// =======================
-// START SERVER
-// =======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
