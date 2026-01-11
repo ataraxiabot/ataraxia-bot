@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 
 // =======================
-// DISCORD CLIENT
+// DISCORD CLIENT (BOT)
 // =======================
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
@@ -25,6 +25,9 @@ await client.login(process.env.DISCORD_TOKEN);
 // =======================
 function auth(req, res, next) {
   const authHeader = req.headers.authorization || "";
+  if (!process.env.BOT_API_KEY) {
+    return res.status(500).json({ ok: false, error: "Missing BOT_API_KEY env in Render" });
+  }
   if (authHeader !== `Bearer ${process.env.BOT_API_KEY}`) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
@@ -32,45 +35,54 @@ function auth(req, res, next) {
 }
 
 // =========================
-// DISCORD OAUTH (WIX FLOW) - IMPERIAL (NO REFRESH)
+// DISCORD OAUTH (WIX FLOW) - SIMPLE + COMPATIBLE
+//  - Wix page-code abre popup a /oauth/discord/start
+//  - Wix espera window.message con:
+//      { type:"discord:ok", discordId, username, global_name, avatar }
 // =========================
-const OAUTH_HMAC_SECRET = process.env.OAUTH_HMAC_SECRET || "";
 
-// ✅ OJO: esto YA NO es tu página Wix, es una página ligera en Render
-// que manda postMessage al opener y se cierra sola.
-const COMPLETE_URL =
-  process.env.OAUTH_COMPLETE_URL ||
-  "https://ataraxia-bot.onrender.com/oauth/discord/complete";
+// Recomendado: usar estado real anti-CSRF con TTL
+const STATE_TTL_MS = 10 * 60 * 1000;
+const stateStore = new Map(); // state -> createdAt
 
-// Canonical message debe ser 1:1 idéntico en Wix/Render
-function canonicalMsg({ discordId, username, global_name, ts, state }) {
-  return [
-    "ATARAXIA_OAUTH_V1",
-    String(discordId || ""),
-    String(username || ""),
-    String(global_name || ""),
-    String(ts || ""),
-    String(state || ""),
-  ].join("|");
+function newState() {
+  const s = crypto.randomBytes(18).toString("hex");
+  stateStore.set(s, Date.now());
+  return s;
 }
 
-function signDiscordReturn(payload) {
-  if (!OAUTH_HMAC_SECRET) return "";
-  const msg = canonicalMsg(payload);
-  return crypto.createHmac("sha256", OAUTH_HMAC_SECRET).update(msg, "utf8").digest("hex");
+function consumeState(state) {
+  const t = stateStore.get(state);
+  stateStore.delete(state);
+  if (!t) return false;
+  return (Date.now() - t) <= STATE_TTL_MS;
+}
+
+function mustEnv(name, v) {
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
 }
 
 app.get("/oauth/discord/start", (req, res) => {
-  const state = "ATARAXIA_" + Date.now(); // state simple
-  const params = new URLSearchParams({
-    client_id: process.env.DISCORD_CLIENT_ID,
-    redirect_uri: process.env.DISCORD_REDIRECT_URI,
-    response_type: "code",
-    scope: "identify",
-    state,
-  });
+  try {
+    mustEnv("DISCORD_CLIENT_ID", process.env.DISCORD_CLIENT_ID);
+    mustEnv("DISCORD_REDIRECT_URI", process.env.DISCORD_REDIRECT_URI);
 
-  return res.redirect("https://discord.com/oauth2/authorize?" + params.toString());
+    const state = newState();
+    const params = new URLSearchParams({
+      client_id: process.env.DISCORD_CLIENT_ID,
+      redirect_uri: process.env.DISCORD_REDIRECT_URI,
+      response_type: "code",
+      scope: "identify",
+      state,
+      prompt: "consent",
+    });
+
+    return res.redirect("https://discord.com/oauth2/authorize?" + params.toString());
+  } catch (e) {
+    console.error("OAuth start error:", e);
+    return res.status(500).send(`OAuth start error: ${e?.message || e}`);
+  }
 });
 
 app.get("/oauth/discord/callback", async (req, res) => {
@@ -79,8 +91,13 @@ app.get("/oauth/discord/callback", async (req, res) => {
 
   if (!code) return res.status(400).send("No code");
   if (!state) return res.status(400).send("No state");
+  if (!consumeState(state)) return res.status(400).send("Invalid/expired state");
 
   try {
+    mustEnv("DISCORD_CLIENT_ID", process.env.DISCORD_CLIENT_ID);
+    mustEnv("DISCORD_CLIENT_SECRET", process.env.DISCORD_CLIENT_SECRET);
+    mustEnv("DISCORD_REDIRECT_URI", process.env.DISCORD_REDIRECT_URI);
+
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -93,8 +110,11 @@ app.get("/oauth/discord/callback", async (req, res) => {
       }),
     });
 
-    const tokenData = await tokenRes.json();
-    if (!tokenData?.access_token) {
+    const tokenTxt = await tokenRes.text();
+    let tokenData = {};
+    try { tokenData = tokenTxt ? JSON.parse(tokenTxt) : {}; } catch {}
+
+    if (!tokenRes.ok || !tokenData?.access_token) {
       console.error("OAuth token error:", tokenData);
       return res.status(401).send("OAuth token error");
     }
@@ -103,63 +123,28 @@ app.get("/oauth/discord/callback", async (req, res) => {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
 
-    const user = await userRes.json();
-    if (!user?.id) {
+    const userTxt = await userRes.text();
+    let user = {};
+    try { user = userTxt ? JSON.parse(userTxt) : {}; } catch {}
+
+    if (!userRes.ok || !user?.id) {
       console.error("Could not fetch user:", user);
       return res.status(500).send("Could not fetch Discord user");
     }
 
-    const safeUser = {
-      id: String(user.id),
+    // ✅ ESTE payload debe coincidir 1:1 con tu Wix page-code actual
+    // Wix escucha d.type === "discord:ok" y lee d.discordId, d.username, d.global_name, d.avatar
+    const payload = {
+      type: "discord:ok",
+      discordId: String(user.id),
       username: String(user.username || ""),
-      global_name: String(user.global_name || ""),
-      avatar: String(user.avatar || ""),
+      global_name: String(user.global_name || user.username || ""),
+      avatar: user.avatar || null,
     };
 
-    // ✅ ts EN SEGUNDOS para que Wix compare bien con nowSec()
-    const ts = String(Math.floor(Date.now() / 1000));
-
-    const sig = signDiscordReturn({
-      discordId: safeUser.id,
-      username: safeUser.username,
-      global_name: safeUser.global_name,
-      ts,
-      state,
-    });
-
-    // ✅ En vez de volver a Wix y refrescar, vamos a una "completion page" en Render
-    const params = new URLSearchParams({
-      discordId: safeUser.id,
-      username: safeUser.username,
-      global_name: safeUser.global_name,
-      avatar: safeUser.avatar,
-      state,
-      ts,
-      sig,
-    });
-
-    return res.redirect(`${COMPLETE_URL}?${params.toString()}`);
-  } catch (err) {
-    console.error("OAuth error:", err);
-    return res.status(500).send("OAuth error");
-  }
-});
-
-// ✅ Completion page: manda mensaje al opener (iframe) y se cierra
-app.get("/oauth/discord/complete", (req, res) => {
-  const q = {
-    discordId: String(req.query.discordId || ""),
-    username: String(req.query.username || ""),
-    global_name: String(req.query.global_name || ""),
-    avatar: String(req.query.avatar || ""),
-    state: String(req.query.state || ""),
-    ts: String(req.query.ts || ""),
-    sig: String(req.query.sig || ""),
-  };
-
-  // HTML minimalista
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  return res.end(`<!doctype html>
+    // ✅ Página final: postMessage a opener y cierra
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.end(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -169,21 +154,11 @@ app.get("/oauth/discord/complete", (req, res) => {
 <body style="font-family:system-ui;background:#0b1020;color:#eaf0ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
   <div style="text-align:center;max-width:520px;padding:20px;">
     <h2 style="margin:0 0 10px 0;">✅ Discord vinculado</h2>
-    <p style="opacity:.75;margin:0 0 14px 0;">Puedes cerrar esta ventana. Regresando al formulario…</p>
+    <p style="opacity:.75;margin:0 0 14px 0;">Ya puedes cerrar esta ventana. Regresando al formulario…</p>
+
     <script>
       (function(){
-        var payload = {
-          type: "discord:ok",
-          discord: {
-            id: ${JSON.stringify(q.discordId)},
-            username: ${JSON.stringify(q.username)},
-            global_name: ${JSON.stringify(q.global_name)},
-            avatar: ${JSON.stringify(q.avatar)}
-          },
-          state: ${JSON.stringify(q.state)},
-          ts: ${JSON.stringify(q.ts)},
-          sig: ${JSON.stringify(q.sig)}
-        };
+        var payload = ${JSON.stringify(payload)};
 
         try {
           if (window.opener && !window.opener.closed) {
@@ -192,11 +167,16 @@ app.get("/oauth/discord/complete", (req, res) => {
         } catch (e) {}
 
         setTimeout(function(){ try { window.close(); } catch(e) {} }, 180);
+        setTimeout(function(){ try { window.close(); } catch(e) {} }, 600);
       })();
     </script>
   </div>
 </body>
 </html>`);
+  } catch (err) {
+    console.error("OAuth error:", err);
+    return res.status(500).send("OAuth error");
+  }
 });
 
 // =========================
@@ -230,62 +210,21 @@ app.post("/roles/sync", auth, async (req, res) => {
 });
 
 // =========================
-// RECLUTAMIENTO - POST A DISCORD (CON VERIFICACIÓN IMPERIAL EN RENDER)
+// RECLUTAMIENTO - POST A DISCORD
+// ✅ ADECUADO A TU WIX ACTUAL:
+// Wix manda: guildId, channelId, discordUserId, discordTag, memberId, answers
+// (SIN oauth bundle)
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
-    const {
-      guildId,
-      channelId,
-      discordUserId,
-      discordTag,
-      answers,
-      memberId,
+    const { guildId, channelId, discordUserId, discordTag, answers, memberId } = req.body || {};
 
-      // imperial bundle
-      oauth
-    } = req.body || {};
-
-    if (!guildId || !channelId || !discordUserId || !answers || !oauth) {
-      return res.status(400).json({ ok: false, error: "Missing fields" });
+    // ✅ En tu backend wix SIEMPRE mandas guildId y channelId,
+    // pero aquí solo exigimos lo realmente necesario para postear.
+    if (!channelId || !discordUserId || !answers || !memberId) {
+      return res.status(400).json({ ok: false, error: "Missing fields (channelId/discordUserId/answers/memberId)" });
     }
 
-    // ✅ Verificación imperial aquí (para no depender de crypto en Wix)
-    const { discordId, username, global_name, ts, state, sig } = oauth || {};
-    if (!discordId || !ts || !state || !sig) {
-      return res.status(400).json({ ok: false, error: "OAuth incomplete (missing discordId/ts/state/sig)" });
-    }
-
-    // bind
-    if (String(discordId) !== String(discordUserId)) {
-      return res.status(401).json({ ok: false, error: "OAuth discord mismatch" });
-    }
-
-    // TTL 5 min
-    const now = Math.floor(Date.now() / 1000);
-    const t = Number(ts);
-    if (!Number.isFinite(t) || t <= 0) {
-      return res.status(401).json({ ok: false, error: "OAuth bad ts" });
-    }
-    if (Math.abs(now - t) > (5 * 60 + 60)) { // 5m + 60s skew
-      return res.status(401).json({ ok: false, error: "OAuth expired" });
-    }
-
-    const expected = signDiscordReturn({
-      discordId: String(discordId),
-      username: String(username || ""),
-      global_name: String(global_name || ""),
-      ts: String(ts),
-      state: String(state),
-    });
-
-    const a = Buffer.from(String(expected), "hex");
-    const b = Buffer.from(String(sig), "hex");
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      return res.status(401).json({ ok: false, error: "OAuth invalid signature" });
-    }
-
-    // ✅ Post a Discord
     const channel = await client.channels.fetch(String(channelId));
     if (!channel || !channel.isTextBased()) {
       return res.status(404).json({ ok: false, error: "Channel not found or not text" });
@@ -296,7 +235,8 @@ app.post("/forms/recruitment", auth, async (req, res) => {
       "",
       `👤 **Discord:** ${discordTag || "Usuario"} (<@${discordUserId}>)`,
       `🆔 **ID:** ${discordUserId}`,
-      memberId ? `🧾 **Wix memberId:** ${memberId}` : null,
+      `🧾 **Wix memberId:** ${memberId}`,
+      guildId ? `🏰 **GuildId:** ${guildId}` : null,
       "",
       "**Respuestas:**",
       `1️⃣ Tipo de gameplay: **${answers.gameplayType}**`,
@@ -309,15 +249,15 @@ app.post("/forms/recruitment", auth, async (req, res) => {
       `8️⃣ ¿Seguir órdenes en PvP masivo?: **${answers.followOrdersMassPvp}**`,
       "",
       "🧠 **9) Si un líder toma una mala decisión:**",
-      answers.badLeaderDecision,
+      String(answers.badLeaderDecision || ""),
       "",
       "🔥 **10) ¿Por qué deberíamos aceptarte?:**",
-      answers.whyAccept,
+      String(answers.whyAccept || ""),
       "",
-      "📜 *Juramento aceptado*",
+      answers.oathAccepted ? "📜 *Juramento aceptado*" : "⚠️ *Juramento no marcado*",
     ].filter(Boolean);
 
-    const msg = await channel.send({ content: lines.join("\n") });
+    const msg = await channel.send({ content: lines.join("\n").slice(0, 1900) });
     return res.json({ ok: true, messageId: msg.id });
   } catch (err) {
     console.error("❌ Recruitment error:", err);
@@ -337,3 +277,4 @@ app.get("/", (req, res) => {
 // =======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
+
