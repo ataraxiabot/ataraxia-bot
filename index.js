@@ -18,7 +18,6 @@ client.once("ready", () => {
   console.log(`🤖 Bot conectado como ${client.user.tag}`);
 });
 
-// Render (Node ESM) permite top-level await
 await client.login(process.env.DISCORD_TOKEN);
 
 // =======================
@@ -35,12 +34,14 @@ function auth(req, res, next) {
 // =========================
 // DISCORD OAUTH (POPUP) - IMPERIAL
 // =========================
-const OAUTH_HMAC_SECRET = process.env.OAUTH_HMAC_SECRET || "";
+const OAUTH_HMAC_SECRET = String(process.env.OAUTH_HMAC_SECRET || "");
+if (!OAUTH_HMAC_SECRET) {
+  console.warn("⚠️ OAUTH_HMAC_SECRET vacío. El verify imperial en Wix fallará.");
+}
 
-// Canonical (DEBE empatar con Wix backend)
-function signDiscordReturn({ discordId, username, global_name, ts, state }) {
-  if (!OAUTH_HMAC_SECRET) return "";
-  const msg = [
+// Canonical string debe coincidir 1:1 con Wix backend
+function canonicalMsg({ discordId, username, global_name, ts, state }) {
+  return [
     "ATARAXIA_OAUTH_V1",
     String(discordId || ""),
     String(username || ""),
@@ -48,8 +49,10 @@ function signDiscordReturn({ discordId, username, global_name, ts, state }) {
     String(ts || ""),
     String(state || "")
   ].join("|");
+}
 
-  return crypto.createHmac("sha256", OAUTH_HMAC_SECRET).update(msg, "utf8").digest("hex");
+function signHex(message) {
+  return crypto.createHmac("sha256", OAUTH_HMAC_SECRET).update(message, "utf8").digest("hex");
 }
 
 app.get("/oauth/discord/start", (req, res) => {
@@ -57,7 +60,7 @@ app.get("/oauth/discord/start", (req, res) => {
 
   const params = new URLSearchParams({
     client_id: process.env.DISCORD_CLIENT_ID,
-    redirect_uri: process.env.DISCORD_REDIRECT_URI, // debe apuntar a /oauth/discord/callback
+    redirect_uri: process.env.DISCORD_REDIRECT_URI, // Debe apuntar a /oauth/discord/callback en Render
     response_type: "code",
     scope: "identify",
     state,
@@ -103,52 +106,62 @@ app.get("/oauth/discord/callback", async (req, res) => {
     }
 
     const safeUser = {
-      id: String(user.id),
+      id: String(user.id || ""),
       username: String(user.username || ""),
       global_name: String(user.global_name || ""),
       avatar: String(user.avatar || ""),
     };
 
-    // ts (segundos) y sig para imperial verify
-    const ts = String(Math.floor(Date.now() / 1000));
-    const sig = signDiscordReturn({
+    const ts = Math.floor(Date.now() / 1000); // SEGUNDOS (igual que Wix)
+    const msg = canonicalMsg({
       discordId: safeUser.id,
       username: safeUser.username,
       global_name: safeUser.global_name,
       ts,
       state
     });
+    const sig = OAUTH_HMAC_SECRET ? signHex(msg) : "";
 
-    // ✅ POPUP RETURN: postMessage al opener y cerrar
+    // ✅ POPUP result -> window.opener (el opener será el iFrame)
+    // No refresca Wix.
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    return res.send(`
-<!doctype html>
+    return res.send(`<!doctype html>
 <html>
-<head><meta charset="utf-8"><title>Discord OAuth</title></head>
-<body>
+<head><meta charset="utf-8"><title>Discord OK</title></head>
+<body style="font-family:system-ui;background:#0b1020;color:#eaf0ff;display:grid;place-items:center;height:100vh;margin:0;">
+  <div style="max-width:560px;padding:20px;border:1px solid rgba(255,255,255,.12);border-radius:14px;background:rgba(255,255,255,.04)">
+    <div style="font-size:14px;opacity:.9;margin-bottom:10px">✅ Discord autorizado</div>
+    <div style="font-size:12px;opacity:.7;margin-bottom:14px">Puedes cerrar esta ventana.</div>
+    <button id="closeBtn" style="padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#eaf0ff;cursor:pointer">Cerrar</button>
+  </div>
+
 <script>
-  (function(){
-    try {
-      if (window.opener) {
-        window.opener.postMessage({
-          type: "discord:ok",
-          discordId: ${JSON.stringify(safeUser.id)},
-          username: ${JSON.stringify(safeUser.username)},
-          global_name: ${JSON.stringify(safeUser.global_name)},
-          avatar: ${JSON.stringify(safeUser.avatar)},
-          state: ${JSON.stringify(state)},
-          ts: ${JSON.stringify(ts)},
-          sig: ${JSON.stringify(sig)}
-        }, "*");
-      }
-    } catch(e) {}
-    try { window.close(); } catch(e) {}
-  })();
+(function(){
+  const payload = {
+    type: "discord:ok",
+    discord: {
+      id: ${JSON.stringify(safeUser.id)},
+      username: ${JSON.stringify(safeUser.username)},
+      global_name: ${JSON.stringify(safeUser.global_name)},
+      avatar: ${JSON.stringify(safeUser.avatar)}
+    },
+    state: ${JSON.stringify(state)},
+    ts: ${JSON.stringify(String(ts))},
+    sig: ${JSON.stringify(sig)}
+  };
+
+  try {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage(payload, "*");
+    }
+  } catch(e) {}
+
+  document.getElementById("closeBtn").addEventListener("click", () => window.close());
+  setTimeout(() => { try { window.close(); } catch(e) {} }, 1200);
+})();
 </script>
 </body>
-</html>
-    `);
-
+</html>`);
   } catch (err) {
     console.error("OAuth error:", err);
     return res.status(500).send("OAuth error");
@@ -190,9 +203,9 @@ app.post("/roles/sync", auth, async (req, res) => {
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
   try {
-    const { channelId, discordUserId, discordTag, answers, memberId } = req.body || {};
+    const { guildId, channelId, discordUserId, discordTag, answers, memberId } = req.body || {};
 
-    if (!channelId || !discordUserId || !answers) {
+    if (!guildId || !channelId || !discordUserId || !answers) {
       return res.status(400).json({ ok: false, error: "Missing fields" });
     }
 
