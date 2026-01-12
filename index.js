@@ -24,20 +24,25 @@ await client.login(process.env.DISCORD_TOKEN);
 // SEGURIDAD BÁSICA (Wix -> Render)
 // =======================
 function auth(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  if (!process.env.BOT_API_KEY) {
+  // Leer header de forma robusta
+  const authHeader = String(req.get("authorization") || req.headers.authorization || "").trim();
+  const key = String(process.env.BOT_API_KEY || "").trim();
+
+  if (!key) {
     return res.status(500).json({ ok: false, error: "Missing BOT_API_KEY env in Render" });
   }
-  if (authHeader !== `Bearer ${process.env.BOT_API_KEY}`) {
+
+  const expected = `Bearer ${key}`;
+
+  if (authHeader !== expected) {
+    // (debug opcional) deja esto mientras pruebas, luego lo puedes quitar
+    console.log("AUTH FAIL:", { got: authHeader, expected });
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
+
   next();
 }
 
-function mustEnv(name, v) {
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
-}
 
 // =========================
 // DISCORD OAUTH (WIX-SAFE)
