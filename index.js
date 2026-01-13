@@ -32,19 +32,24 @@ function mustEnv(name, val) {
 // AUTH (Wix -> Render)
 // =======================
 function auth(req, res, next) {
-  const authHeader = String(req.get("authorization") || req.headers.authorization || "").trim();
+  const got = String(req.headers.authorization || "").trim();
   const key = String(process.env.BOT_API_KEY || "").trim();
 
-  if (!key) return res.status(500).json({ ok: false, error: "Missing BOT_API_KEY env in Render" });
+  if (!key) {
+    console.error("❌ BOT_API_KEY missing in Render env");
+    return res.status(500).json({ ok: false, error: "Server misconfigured" });
+  }
 
   const expected = `Bearer ${key}`;
-  if (authHeader !== expected) {
-    console.log("AUTH FAIL:", { got: authHeader, expected: "Bearer ***" });
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  if (got !== expected) {
+    console.error("❌ AUTH FAIL", { got, expected });
+    return res.status(403).json({ ok: false, error: "Forbidden" });
   }
 
   next();
 }
+
 
 // =========================
 // DISCORD OAUTH (optional)
