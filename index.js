@@ -1,18 +1,28 @@
 // =========================================================
-// RENDER (index.js) - COMPLETO / BLINDADO
-// Endpoints:
-//   POST /oauth/start
-//   POST /oauth/exchange
-//   POST /recruitment/submit
+// RENDER (index.js) - COMPLETO / COMPATIBLE CON TU SETUP ACTUAL
 //
-// ENV (Render):
-//   PORT
-//   API_KEY
+// ✅ Soporta tus ENV tal como salen en tu screenshot:
+//   BOT_API_KEY
 //   DISCORD_CLIENT_ID
 //   DISCORD_CLIENT_SECRET
-//   DISCORD_REDIRECT_URI   (https://www.comunidad-ataraxia.com/discord-callback)
-//   DISCORD_BOT_TOKEN
-//   DISCORD_GUILD_ID
+//   DISCORD_REDIRECT_URI          (ahorita lo tienes: https://ataraxia-bot.onrender.com/oauth/discord/callback)
+//   DISCORD_TOKEN                 (token del bot)
+//   RECRUIT_CHANNEL_ID            (1459207254015217674)
+//   WIX_RETURN_URL                (https://www.comunidad-ataraxia.com/registro-nuevos-miembros)
+//
+// ✅ Rutas (y alias para evitar 404):
+//   POST /oauth/start
+//   POST /oauth/discord/start          (alias)
+//   POST /oauth/exchange
+//   POST /oauth/discord/exchange       (alias)
+//   POST /recruitment/submit
+//   POST /oauth/discord/submit         (alias)
+//   GET  /oauth/discord/callback       (TU redirect actual) -> redirige a WIX_RETURN_URL con ?code&state
+//
+// Importante:
+// - Este servidor NO depende de window ni nada de Wix.
+// - Wix sólo llama /oauth/start, /oauth/exchange y /recruitment/submit
+// - Discord redirige a /oauth/discord/callback (Render) y Render te regresa a Wix (WIX_RETURN_URL).
 // =========================================================
 import "dotenv/config";
 import express from "express";
@@ -23,46 +33,58 @@ const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
-const API_KEY = String(process.env.API_KEY || "");
 
+// ===== ENV (NOMBRES SEGÚN TU SCREENSHOT) =====
+const BOT_API_KEY = String(process.env.BOT_API_KEY || ""); // ✅ antes era API_KEY
 const DISCORD_CLIENT_ID = String(process.env.DISCORD_CLIENT_ID || "");
 const DISCORD_CLIENT_SECRET = String(process.env.DISCORD_CLIENT_SECRET || "");
 const DISCORD_REDIRECT_URI = String(process.env.DISCORD_REDIRECT_URI || "");
+const DISCORD_TOKEN = String(process.env.DISCORD_TOKEN || ""); // ✅ antes DISCORD_BOT_TOKEN
+const RECRUIT_CHANNEL_ID = String(process.env.RECRUIT_CHANNEL_ID || "");
+const WIX_RETURN_URL = String(process.env.WIX_RETURN_URL || "");
 
-const DISCORD_BOT_TOKEN = String(process.env.DISCORD_BOT_TOKEN || "");
-const DISCORD_GUILD_ID = String(process.env.DISCORD_GUILD_ID || "");
+const DISCORD_GUILD_ID = String(process.env.DISCORD_GUILD_ID || ""); // opcional, si lo tienes
+const DEFAULT_SCOPE = "identify";
 
-const OAUTH_SCOPE = "identify";
+function missingEnv() {
+  const miss = [];
+  if (!BOT_API_KEY) miss.push("BOT_API_KEY");
+  if (!DISCORD_CLIENT_ID) miss.push("DISCORD_CLIENT_ID");
+  if (!DISCORD_CLIENT_SECRET) miss.push("DISCORD_CLIENT_SECRET");
+  if (!DISCORD_REDIRECT_URI) miss.push("DISCORD_REDIRECT_URI");
+  if (!DISCORD_TOKEN) miss.push("DISCORD_TOKEN");
+  if (!RECRUIT_CHANNEL_ID) miss.push("RECRUIT_CHANNEL_ID");
+  if (!WIX_RETURN_URL) miss.push("WIX_RETURN_URL");
+  return miss;
+}
 
 function requireApiKey(req, res, next) {
   try {
     const got = String(req.headers["x-api-key"] || "");
-    if (!API_KEY) return res.status(500).json({ ok: false, error: "API_KEY_MISSING" });
-    if (got !== API_KEY) return res.status(401).json({ ok: false, error: "INVALID_API_KEY" });
-    next();
+    if (!BOT_API_KEY) return res.status(500).json({ ok: false, error: "BOT_API_KEY_MISSING" });
+    if (got !== BOT_API_KEY) return res.status(401).json({ ok: false, error: "INVALID_API_KEY" });
+    return next();
   } catch (e) {
     return res.status(500).json({ ok: false, error: "AUTH_MIDDLEWARE_FAILED" });
   }
 }
 
-function envMissing() {
-  const miss = [];
-  if (!DISCORD_CLIENT_ID) miss.push("DISCORD_CLIENT_ID");
-  if (!DISCORD_CLIENT_SECRET) miss.push("DISCORD_CLIENT_SECRET");
-  if (!DISCORD_REDIRECT_URI) miss.push("DISCORD_REDIRECT_URI");
-  if (!DISCORD_BOT_TOKEN) miss.push("DISCORD_BOT_TOKEN");
-  if (!DISCORD_GUILD_ID) miss.push("DISCORD_GUILD_ID");
-  if (!API_KEY) miss.push("API_KEY");
-  return miss;
+function jsonOk(extra = {}) {
+  return { ok: true, ...extra };
+}
+function jsonFail(error, details) {
+  const out = { ok: false, error: String(error || "UNKNOWN") };
+  if (details !== undefined) out.details = details;
+  return out;
 }
 
-async function discordTokenExchange(code, redirectUri) {
+async function discordTokenExchange(code) {
   const body = new URLSearchParams();
   body.set("client_id", DISCORD_CLIENT_ID);
   body.set("client_secret", DISCORD_CLIENT_SECRET);
   body.set("grant_type", "authorization_code");
   body.set("code", code);
-  body.set("redirect_uri", redirectUri);
+  body.set("redirect_uri", DISCORD_REDIRECT_URI); // ✅ SIEMPRE el del ENV para que no haya mismatch
 
   const resp = await fetch("https://discord.com/api/oauth2/token", {
     method: "POST",
@@ -99,7 +121,7 @@ async function discordSendChannelMessage(channelId, content) {
   const resp = await fetch(`https://discord.com/api/channels/${channelId}/messages`, {
     method: "POST",
     headers: {
-      Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+      Authorization: `Bot ${DISCORD_TOKEN}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ content }),
@@ -116,13 +138,12 @@ async function discordSendChannelMessage(channelId, content) {
 }
 
 async function discordAddRole(guildId, userId, roleId) {
+  if (!guildId) return false; // si no tienes DISCORD_GUILD_ID, no intentamos
   const resp = await fetch(`https://discord.com/api/guilds/${guildId}/members/${userId}/roles/${roleId}`, {
     method: "PUT",
-    headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+    headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
   });
-
   if (resp.status === 204) return true;
-
   if (!resp.ok) {
     const txt = await resp.text();
     throw new Error(`add_role_failed:${resp.status}:${txt}`);
@@ -172,43 +193,77 @@ function buildRecruitmentMessage({ discordId, discordUsername, ownerId, answers 
   return content.length > 1900 ? content.slice(0, 1900) + "\n…" : content;
 }
 
+// ===== Health =====
 app.get("/", (_req, res) => res.send("OK"));
-app.get("/health", (_req, res) => res.json({ ok: envMissing().length === 0, missing: envMissing() }));
+app.get("/health", (_req, res) => res.json({ ok: missingEnv().length === 0, missing: missingEnv() }));
 
-app.post("/oauth/start", requireApiKey, async (_req, res) => {
+// =========================================================
+// ✅ DISCORD REDIRECT ACTUAL (Render)
+// Discord manda aquí code/state.
+// Nosotros lo regresamos a Wix con esos params.
+// =========================================================
+app.get("/oauth/discord/callback", (req, res) => {
   try {
-    const missing = envMissing();
-    if (missing.length) return res.status(500).json({ ok: false, error: "MISSING_ENV", missing });
+    const q = req.query || {};
+    const code = String(q.code || "").trim();
+    const state = String(q.state || "").trim();
+    const error = String(q.error || "").trim();
+    const error_description = String(q.error_description || "").trim();
+
+    const params = [];
+    if (code) params.push(`code=${encodeURIComponent(code)}`);
+    if (state) params.push(`state=${encodeURIComponent(state)}`);
+    if (error) params.push(`error=${encodeURIComponent(error)}`);
+    if (error_description) params.push(`error_description=${encodeURIComponent(error_description)}`);
+
+    const target = `${WIX_RETURN_URL}${params.length ? (WIX_RETURN_URL.includes("?") ? "&" : "?") + params.join("&") : ""}`;
+    return res.redirect(302, target);
+  } catch (e) {
+    return res.status(500).send("callback_failed");
+  }
+});
+
+// =========================================================
+// OAUTH START (con alias /oauth/discord/start)
+// =========================================================
+async function handleOauthStart(_req, res) {
+  try {
+    const miss = missingEnv();
+    if (miss.length) return res.status(500).json(jsonFail("MISSING_ENV", miss));
 
     const state = crypto.randomBytes(16).toString("hex");
     const params = new URLSearchParams({
       client_id: DISCORD_CLIENT_ID,
       redirect_uri: DISCORD_REDIRECT_URI,
       response_type: "code",
-      scope: OAUTH_SCOPE,
+      scope: DEFAULT_SCOPE,
       state,
       prompt: "consent",
     });
 
     const url = `https://discord.com/oauth2/authorize?${params.toString()}`;
-    return res.json({ ok: true, url, state });
+    return res.json(jsonOk({ url, state }));
   } catch (e) {
     console.error("OAUTH_START_ERROR:", e);
-    return res.status(500).json({ ok: false, error: "OAUTH_START_FAILED" });
+    return res.status(500).json(jsonFail("OAUTH_START_FAILED"));
   }
-});
+}
 
-app.post("/oauth/exchange", requireApiKey, async (req, res) => {
+app.post("/oauth/start", requireApiKey, handleOauthStart);
+app.post("/oauth/discord/start", requireApiKey, handleOauthStart);
+
+// =========================================================
+// OAUTH EXCHANGE (con alias /oauth/discord/exchange)
+// =========================================================
+async function handleOauthExchange(req, res) {
   try {
-    const missing = envMissing();
-    if (missing.length) return res.status(500).json({ ok: false, error: "MISSING_ENV", missing });
+    const miss = missingEnv();
+    if (miss.length) return res.status(500).json(jsonFail("MISSING_ENV", miss));
 
     const code = String(req.body?.code || "").trim();
-    const redirectUri = String(req.body?.redirect_uri || DISCORD_REDIRECT_URI).trim();
-    if (!code) return res.status(400).json({ ok: false, error: "MISSING_CODE" });
-    if (!redirectUri) return res.status(400).json({ ok: false, error: "MISSING_REDIRECT_URI" });
+    if (!code) return res.status(400).json(jsonFail("MISSING_CODE"));
 
-    const token = await discordTokenExchange(code, redirectUri);
+    const token = await discordTokenExchange(code);
     const me = await discordGetMe(token.access_token);
 
     const discordId = me.id;
@@ -218,47 +273,57 @@ app.post("/oauth/exchange", requireApiKey, async (req, res) => {
         ? `${me.username}#${me.discriminator}`
         : me.username;
 
-    return res.json({ ok: true, discordId, discordUsername, discordTag });
+    return res.json(jsonOk({ discordId, discordUsername, discordTag }));
   } catch (e) {
     console.error("OAUTH_EXCHANGE_ERROR:", e);
-    return res.status(500).json({ ok: false, error: "OAUTH_EXCHANGE_FAILED" });
+    return res.status(500).json(jsonFail("OAUTH_EXCHANGE_FAILED", String(e?.message || e)));
   }
-});
+}
 
-app.post("/recruitment/submit", requireApiKey, async (req, res) => {
+app.post("/oauth/exchange", requireApiKey, handleOauthExchange);
+app.post("/oauth/discord/exchange", requireApiKey, handleOauthExchange);
+
+// =========================================================
+// RECRUITMENT SUBMIT (con alias /oauth/discord/submit)
+// =========================================================
+async function handleRecruitmentSubmit(req, res) {
   try {
-    const missing = envMissing();
-    if (missing.length) return res.status(500).json({ ok: false, error: "MISSING_ENV", missing });
+    const miss = missingEnv();
+    if (miss.length) return res.status(500).json(jsonFail("MISSING_ENV", miss));
 
     const discordId = String(req.body?.discordId || "").trim();
     const discordUsername = String(req.body?.discordUsername || "").trim();
     const ownerId = String(req.body?.ownerId || "").trim();
     const answers = req.body?.answers || {};
 
-    const channelId = String(req.body?.channelId || "").trim();
-    const roleId = String(req.body?.roleId || "").trim();
+    const roleId = String(req.body?.roleId || "").trim(); // si lo mandas desde Wix
+    const channelId = String(req.body?.channelId || "").trim() || RECRUIT_CHANNEL_ID;
 
-    if (!discordId) return res.status(400).json({ ok: false, error: "MISSING_DISCORD_ID" });
-    if (!channelId) return res.status(400).json({ ok: false, error: "MISSING_CHANNEL_ID" });
-    if (!roleId) return res.status(400).json({ ok: false, error: "MISSING_ROLE_ID" });
-    if (!answers?.personaje || !answers?.clase) return res.status(400).json({ ok: false, error: "MISSING_REQUIRED_ANSWERS" });
+    if (!discordId) return res.status(400).json(jsonFail("MISSING_DISCORD_ID"));
+    if (!channelId) return res.status(400).json(jsonFail("MISSING_CHANNEL_ID"));
+    if (!answers?.personaje || !answers?.clase) return res.status(400).json(jsonFail("MISSING_REQUIRED_ANSWERS"));
 
     const content = buildRecruitmentMessage({ discordId, discordUsername, ownerId, answers });
     await discordSendChannelMessage(channelId, content);
 
     let roleAssigned = false;
-    try {
-      await discordAddRole(DISCORD_GUILD_ID, discordId, roleId);
-      roleAssigned = true;
-    } catch (e) {
-      roleAssigned = false; // si no está en el server, no tiramos todo
+    if (roleId) {
+      try {
+        await discordAddRole(DISCORD_GUILD_ID, discordId, roleId);
+        roleAssigned = true;
+      } catch (_) {
+        roleAssigned = false;
+      }
     }
 
-    return res.json({ ok: true, posted: true, roleAssigned });
+    return res.json(jsonOk({ posted: true, roleAssigned }));
   } catch (e) {
     console.error("RECRUITMENT_SUBMIT_ERROR:", e);
-    return res.status(500).json({ ok: false, error: "RECRUITMENT_SUBMIT_FAILED" });
+    return res.status(500).json(jsonFail("RECRUITMENT_SUBMIT_FAILED", String(e?.message || e)));
   }
-});
+}
+
+app.post("/recruitment/submit", requireApiKey, handleRecruitmentSubmit);
+app.post("/oauth/discord/submit", requireApiKey, handleRecruitmentSubmit);
 
 app.listen(PORT, () => console.log("Ataraxia Render API on", PORT));
