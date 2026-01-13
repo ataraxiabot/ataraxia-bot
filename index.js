@@ -2,34 +2,38 @@ import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, GatewayIntentBits, Partials } from "discord.js";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+
+// =======================
+// HELPERS
+// =======================
+function mustEnv(name, v) {
+  if (!String(v || "").trim()) throw new Error(`Missing env: ${name}`);
+  return String(v).trim();
+}
 
 // =======================
 // DISCORD CLIENT (BOT)
 // =======================
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers, // para asignar roles
+  ],
+  partials: [Partials.GuildMember],
 });
 
 client.once("ready", () => {
   console.log(`🤖 Bot conectado como ${client.user.tag}`);
 });
 
-await client.login(process.env.DISCORD_TOKEN);
+await client.login(mustEnv("DISCORD_TOKEN", process.env.DISCORD_TOKEN));
 
 // =======================
-// HELPERS
-// =======================
-function mustEnv(name, val) {
-  if (!val) throw new Error(`Missing env: ${name}`);
-  return String(val);
-}
-
-// =======================
-// AUTH (Wix -> Render)
+// SEGURIDAD (Wix -> Render)
 // =======================
 function auth(req, res, next) {
   const got = String(req.headers.authorization || "").trim();
@@ -50,13 +54,12 @@ function auth(req, res, next) {
   next();
 }
 
-
 // =========================
-// DISCORD OAUTH (optional)
+// DISCORD OAUTH (server-side, scope identify)
 // =========================
 const STATE_TTL_MS = 10 * 60 * 1000;
-const stateStore = new Map();
-const returnUrlStore = new Map();
+const stateStore = new Map();      // state -> createdAt
+const returnUrlStore = new Map();  // state -> returnUrl
 
 function newState() {
   const s = crypto.randomBytes(18).toString("hex");
@@ -67,9 +70,8 @@ function consumeState(state) {
   const t = stateStore.get(state);
   stateStore.delete(state);
   if (!t) return false;
-  return (Date.now() - t) <= STATE_TTL_MS;
+  return Date.now() - t <= STATE_TTL_MS;
 }
-
 setInterval(() => {
   const now = Date.now();
   for (const [k, t] of stateStore.entries()) {
@@ -108,7 +110,6 @@ app.get("/oauth/discord/start", (req, res) => {
 app.get("/oauth/discord/callback", async (req, res) => {
   const code = String(req.query.code || "").trim();
   const state = String(req.query.state || "").trim();
-
   if (!code) return res.status(400).send("No code");
   if (!state) return res.status(400).send("No state");
   if (!consumeState(state)) return res.status(401).send("Invalid/expired state");
@@ -155,15 +156,13 @@ app.get("/oauth/discord/callback", async (req, res) => {
 
     const returnUrl =
       String(returnUrlStore.get(state) || "").trim() ||
-      process.env.WIX_RETURN_URL ||
+      String(process.env.WIX_RETURN_URL || "").trim() ||
       "https://www.comunidad-ataraxia.com/registro-nuevos-miembros";
 
     returnUrlStore.delete(state);
 
     const p = new URLSearchParams({
-      oauth: "discord",
-      code,
-      state,
+      oauth: "ok",
       discordId: safe.discordId,
       username: safe.username,
       global_name: safe.global_name,
@@ -178,106 +177,117 @@ app.get("/oauth/discord/callback", async (req, res) => {
 });
 
 // =========================
-// ROLES SYNC
-// =========================
-app.post("/roles/sync", auth, async (req, res) => {
-  try {
-    const { guildId, discordUserId, rolesAdd = [], rolesRemove = [] } = req.body || {};
-
-    if (!guildId || !discordUserId) {
-      return res.status(400).json({ ok: false, error: "Missing guildId/discordUserId" });
-    }
-
-    const guild = await client.guilds.fetch(String(guildId));
-    if (!guild) return res.status(404).json({ ok: false, error: "Guild not found" });
-
-    const member = await guild.members.fetch(String(discordUserId)).catch(() => null);
-    if (!member) return res.status(404).json({ ok: false, error: "Member not found in guild" });
-
-    const add = Array.isArray(rolesAdd) ? rolesAdd.map(String).filter(Boolean) : [];
-    const rem = Array.isArray(rolesRemove) ? rolesRemove.map(String).filter(Boolean) : [];
-
-    if (rem.length) await member.roles.remove(rem);
-    if (add.length) await member.roles.add(add);
-
-    return res.json({ ok: true, guildId, discordUserId, rolesAdd: add, rolesRemove: rem });
-  } catch (err) {
-    console.error("❌ roles/sync error:", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
-  }
-});
-
-// =========================
-// FORMS: Recruitment -> Channel
+// RECLUTAMIENTO (Wix -> Render)
+// - Postea al canal
+// - Asigna rol "esperando validación"
 // =========================
 app.post("/forms/recruitment", auth, async (req, res) => {
+  const started = Date.now();
+
   try {
-    const { guildId, channelId, discordUserId, discordTag, answers, memberId } = req.body || {};
+    console.log("✅ HIT /forms/recruitment");
 
-    if (!guildId || !channelId || !discordUserId || !answers) {
-      return res.status(400).json({ ok: false, error: "Missing fields", got: { guildId, channelId, discordUserId, hasAnswers: !!answers } });
+    // Usa env por defecto (y permite override si mandas en body)
+    const guildId = String(req.body?.guildId || process.env.DISCORD_GUILD_ID || "").trim();
+    const channelId = String(req.body?.channelId || process.env.DISCORD_RECRUIT_CHANNEL_ID || "").trim();
+    const waitingRoleId = String(req.body?.waitingRoleId || process.env.DISCORD_WAITING_ROLE_ID || "").trim();
+
+    // Campos esperados
+    const discordUserId = String(req.body?.discordUserId || "").trim();
+    const discordTag = String(req.body?.discordTag || "").trim();
+    const memberId = String(req.body?.memberId || "").trim();
+    const answers = req.body?.answers || {};
+
+    // Logs útiles (sin exponer secrets)
+    console.log("PAYLOAD:", {
+      guildId,
+      channelId,
+      waitingRoleId,
+      discordUserId,
+      memberId,
+      hasAnswers: !!answers && typeof answers === "object",
+    });
+
+    if (!guildId || !channelId || !waitingRoleId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing DISCORD_GUILD_ID / DISCORD_RECRUIT_CHANNEL_ID / DISCORD_WAITING_ROLE_ID",
+      });
     }
+    if (!discordUserId) return res.status(400).json({ ok: false, error: "Missing discordUserId" });
+    if (!answers?.oathAccepted) return res.status(400).json({ ok: false, error: "Oath not accepted" });
 
-    const channel = await client.channels.fetch(String(channelId)).catch(() => null);
+    // 1) Postear en canal
+    const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel || !channel.isTextBased()) {
-      return res.status(404).json({ ok: false, error: "Channel not found or not text" });
+      return res.status(404).json({ ok: false, error: "Channel not found or not text-based" });
     }
-
-    // Formateo del mensaje
-    const personaje = String(answers.personaje || answers.characterName || "—");
-    const clase = String(answers.clase || "—");
-    const expAoc = String(answers.expAoc || "—");
-
-    const dispo = answers.disponibilidad || {};
-    const dias = Array.isArray(dispo.dias) ? dispo.dias.join(", ") : String(dispo.dias || "—");
-    const rangos = Array.isArray(dispo.rangos) ? dispo.rangos.join(", ") : String(dispo.rangos || "—");
 
     const lines = [
       "🛡️ **Nueva Solicitud de Reclutamiento – Ataraxia**",
       "",
       `👤 **Discord:** ${discordTag || "Usuario"} (<@${discordUserId}>)`,
-      `🆔 **Discord ID:** ${discordUserId}`,
+      `🆔 **ID:** ${discordUserId}`,
       memberId ? `🧾 **Wix memberId:** ${memberId}` : null,
       "",
-      `🎭 **Personaje:** **${personaje}**`,
-      `🧬 **Clase:** **${clase}**`,
-      `⏳ **Experiencia en AoC:** **${expAoc}**`,
-      "",
-      "🗓️ **Disponibilidad (CDMX):**",
-      `• Días: ${dias}`,
-      `• Horarios: ${rangos}`,
-      "",
-      "📌 **Cuestionario:**",
-      `• ¿Por qué deseas unirte?: ${String(answers.motivo || answers.whyAccept || "—")}`,
-      `• Experiencia MMORPGs: ${String(answers.mmorpg || "—")}`,
-      "",
-      "⚖️ **Compromiso y disciplina:**",
-      `• Ayudar a nuevos: ${String(answers.helpNewbies || "—")}`,
-      `• Acepta jerarquía: ${String(answers.acceptHierarchy || "—")}`,
-      `• Obedece calls PvP: ${String(answers.followOrdersMassPvp || "—")}`,
-      `• Perfil: ${String(answers.leaderOrExecutor || "—")}`,
-      `• Sacrificar loot: ${String(answers.loseLoot || "—")}`,
-      "",
-      "🧠 **Si un líder se equivoca:**",
-      String(answers.badLeaderDecision || "—"),
+      "**Respuestas:**",
+      `1️⃣ ¿Por qué deseas unirte a Ataraxia?: **${answers.whyJoin || "—"}**`,
+      `2️⃣ Experiencia en Ashes of Creation: **${answers.aocExperience || "—"}**`,
+      `3️⃣ Rol principal (clase): **${answers.mainClass || "—"}**`,
+      `4️⃣ Disponibilidad (días): **${Array.isArray(answers.days) ? answers.days.join(", ") : (answers.days || "—")}**`,
+      `5️⃣ Disponibilidad (horarios): **${Array.isArray(answers.times) ? answers.times.join(", ") : (answers.times || "—")}**`,
+      `6️⃣ ¿Ayudar a nuevos?: **${answers.helpNewbies || "—"}**`,
+      `7️⃣ ¿Aceptas jerarquía?: **${answers.acceptHierarchy || "—"}**`,
+      `8️⃣ ¿Obedecer calls en PvP?: **${answers.followOrdersPvp || "—"}**`,
+      `9️⃣ ¿Líder o ejecutor?: **${answers.leaderOrExecutor || "—"}**`,
+      `🔟 ¿Perder loot por la guild?: **${answers.loseLoot || "—"}**`,
       "",
       "📜 **Juramento:**",
-      answers.oathAccepted ? "✅ Aceptado" : "❌ No aceptado",
+      `✅ ${String(answers.oathText || "Juramento aceptado").trim()}`,
     ].filter(Boolean);
 
-    const msg = await channel.send({ content: lines.join("\n") });
+    const sent = await channel.send({ content: lines.join("\n") });
 
-    return res.json({ ok: true, messageId: msg.id });
+    // 2) Asignar rol
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) {
+      return res.status(404).json({ ok: false, error: "Guild not found", messageId: sent.id });
+    }
+
+    const member = await guild.members.fetch(discordUserId).catch(() => null);
+    if (!member) {
+      // Esto pasa si el usuario NO está en el servidor
+      return res.status(404).json({
+        ok: false,
+        error: "Member not found in guild (user is not in the server)",
+        messageId: sent.id,
+      });
+    }
+
+    // Si el bot no puede asignar: aquí truena con error claro
+    await member.roles.add(waitingRoleId);
+
+    return res.json({
+      ok: true,
+      messageId: sent.id,
+      roleAdded: waitingRoleId,
+      ms: Date.now() - started,
+    });
   } catch (err) {
     console.error("❌ /forms/recruitment error:", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    });
   }
 });
 
 // =======================
 // HEALTHCHECK
 // =======================
-app.get("/", (req, res) => res.json({ ok: true, service: "ataraxia-bot" }));
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "ataraxia-bot" });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ API escuchando en puerto", PORT));
