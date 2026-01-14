@@ -1,28 +1,5 @@
 // =========================================================
 // RENDER (index.js) - COMPLETO / ROBUSTO / COMPATIBLE
-//
-// ✅ ENV esperadas (según tu setup):
-//   BOT_API_KEY
-//   DISCORD_CLIENT_ID
-//   DISCORD_CLIENT_SECRET
-//   DISCORD_REDIRECT_URI          (ej: https://ataraxia-bot.onrender.com/oauth/discord/callback)
-//   DISCORD_TOKEN                 (token del bot)
-//   RECRUIT_CHANNEL_ID
-//   WIX_RETURN_URL                (ej: https://www.comunidad-ataraxia.com/registro-nuevos-miembros)
-//
-// ✅ Rutas (y alias):
-//   POST /oauth/start
-//   POST /oauth/discord/start          (alias)
-//   POST /oauth/exchange
-//   POST /oauth/discord/exchange       (alias)
-//   POST /recruitment/submit
-//   POST /oauth/discord/submit         (alias)
-//   GET  /oauth/discord/callback       (redirect de Discord) -> redirige a WIX_RETURN_URL con ?code&state
-//
-// ✅ Fixes clave:
-// - Manejo correcto de invalid_grant (400/409, NO 500)
-// - Anti doble-canje del code (TTL in-memory)
-// - Token exchange form-urlencoded correcto
 // =========================================================
 
 import "dotenv/config";
@@ -45,7 +22,7 @@ const RECRUIT_CHANNEL_ID = String(process.env.RECRUIT_CHANNEL_ID || "");
 const WIX_RETURN_URL = String(process.env.WIX_RETURN_URL || "");
 
 // Opcionales
-const DISCORD_GUILD_ID = String(process.env.DISCORD_GUILD_ID || ""); // si quieres asignar roles
+const DISCORD_GUILD_ID = String(process.env.DISCORD_GUILD_ID || "");
 const DEFAULT_SCOPE = "identify";
 
 // ===== Utils ENV =====
@@ -88,8 +65,6 @@ const CODE_TTL_MS = 5 * 60 * 1000; // 5 min
 function markCodeUsed(code) {
   const now = Date.now();
   USED_CODES.set(code, now);
-
-  // limpieza ligera
   for (const [k, t] of USED_CODES) {
     if (now - t > CODE_TTL_MS) USED_CODES.delete(k);
   }
@@ -121,11 +96,10 @@ async function discordTokenExchange(code) {
 
   const txt = await resp.text();
   let data = null;
-  try {
-    data = txt ? JSON.parse(txt) : null;
-  } catch (_) {}
+  try { data = txt ? JSON.parse(txt) : null; } catch (_) {}
 
   if (!resp.ok || !data?.access_token) {
+    // Deja el texto para detectar invalid_grant arriba
     throw new Error(`token_exchange_failed:${resp.status}:${txt}`);
   }
   return data;
@@ -138,9 +112,7 @@ async function discordGetMe(accessToken) {
 
   const txt = await resp.text();
   let data = null;
-  try {
-    data = txt ? JSON.parse(txt) : null;
-  } catch (_) {}
+  try { data = txt ? JSON.parse(txt) : null; } catch (_) {}
 
   if (!resp.ok || !data?.id) {
     throw new Error(`get_me_failed:${resp.status}:${txt}`);
@@ -160,9 +132,7 @@ async function discordSendChannelMessage(channelId, content) {
 
   const txt = await resp.text();
   let data = null;
-  try {
-    data = txt ? JSON.parse(txt) : null;
-  } catch (_) {}
+  try { data = txt ? JSON.parse(txt) : null; } catch (_) {}
 
   if (!resp.ok || !data?.id) {
     throw new Error(`send_message_failed:${resp.status}:${txt}`);
@@ -174,10 +144,7 @@ async function discordAddRole(guildId, userId, roleId) {
   if (!guildId) return false;
   const resp = await fetch(
     `https://discord.com/api/guilds/${guildId}/members/${userId}/roles/${roleId}`,
-    {
-      method: "PUT",
-      headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
-    }
+    { method: "PUT", headers: { Authorization: `Bot ${DISCORD_TOKEN}` } }
   );
   if (resp.status === 204) return true;
   if (!resp.ok) {
@@ -237,7 +204,7 @@ app.get("/health", (_req, res) =>
 );
 
 // =========================================================
-// ✅ DISCORD REDIRECT (Render) -> regresa a Wix con ?code&state
+// DISCORD REDIRECT (Render) -> regresa a Wix con ?code&state
 // =========================================================
 app.get("/oauth/discord/callback", (req, res) => {
   try {
@@ -293,7 +260,7 @@ app.post("/oauth/start", requireApiKey, handleOauthStart);
 app.post("/oauth/discord/start", requireApiKey, handleOauthStart);
 
 // =========================================================
-// OAUTH EXCHANGE (y alias) - FIX invalid_grant + doble canje
+// OAUTH EXCHANGE (y alias)
 // =========================================================
 async function handleOauthExchange(req, res) {
   try {
@@ -303,11 +270,11 @@ async function handleOauthExchange(req, res) {
     const code = String(req.body?.code || "").trim();
     if (!code) return res.status(400).json(jsonFail("MISSING_CODE"));
 
-    // ✅ doble intento = 409
+    // doble intento = 409
     if (wasCodeUsed(code)) {
       return res
         .status(409)
-        .json(jsonFail("CODE_ALREADY_USED", "Este code ya fue canjeado (doble click/doble callback)."));
+        .json(jsonFail("CODE_ALREADY_USED", "Este code ya fue canjeado (doble request)."));
     }
 
     let token, me;
@@ -317,16 +284,15 @@ async function handleOauthExchange(req, res) {
     } catch (e) {
       const msg = String(e?.message || e);
 
-      // ✅ invalid_grant = 400 (no 500)
+      // ✅ invalid_grant = 400 (no marcar como used)
       if (msg.includes("invalid_grant")) {
-        markCodeUsed(code);
         return res.status(400).json(jsonFail("OAUTH_INVALID_GRANT", msg));
       }
 
       return res.status(502).json(jsonFail("OAUTH_PROVIDER_ERROR", msg));
     }
 
-    // ✅ code gastado
+    // ✅ SOLO aquí marcamos usado (cuando realmente lo canjeamos bien)
     markCodeUsed(code);
 
     const discordId = me.id;
@@ -359,7 +325,7 @@ async function handleRecruitmentSubmit(req, res) {
     const ownerId = String(req.body?.ownerId || "").trim();
     const answers = req.body?.answers || {};
 
-    const roleId = String(req.body?.roleId || "").trim(); // opcional desde Wix
+    const roleId = String(req.body?.roleId || "").trim(); // opcional
     const channelId = String(req.body?.channelId || "").trim() || RECRUIT_CHANNEL_ID;
 
     if (!discordId) return res.status(400).json(jsonFail("MISSING_DISCORD_ID"));
@@ -390,5 +356,4 @@ async function handleRecruitmentSubmit(req, res) {
 app.post("/recruitment/submit", requireApiKey, handleRecruitmentSubmit);
 app.post("/oauth/discord/submit", requireApiKey, handleRecruitmentSubmit);
 
-// ===== Start =====
 app.listen(PORT, () => console.log("Ataraxia Render API on", PORT));
