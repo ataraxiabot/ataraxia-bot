@@ -1,5 +1,24 @@
 // =========================================================
-// RENDER (index.js) - COMPLETO / ROBUSTO / COMPATIBLE
+// RENDER (index.js) - COMPLETO / ROBUSTO / IDEMPOTENTE
+//
+// ✅ ENV esperadas:
+//   BOT_API_KEY
+//   DISCORD_CLIENT_ID
+//   DISCORD_CLIENT_SECRET
+//   DISCORD_REDIRECT_URI
+//   DISCORD_TOKEN
+//   RECRUIT_CHANNEL_ID
+//   WIX_RETURN_URL
+//
+// Opcional:
+//   DISCORD_GUILD_ID
+//
+// ✅ Rutas:
+//   POST /oauth/start
+//   POST /oauth/exchange         (IDEMPOTENTE)
+//   POST /recruitment/submit
+//   GET  /oauth/discord/callback
+//
 // =========================================================
 
 import "dotenv/config";
@@ -21,11 +40,11 @@ const DISCORD_TOKEN = String(process.env.DISCORD_TOKEN || "");
 const RECRUIT_CHANNEL_ID = String(process.env.RECRUIT_CHANNEL_ID || "");
 const WIX_RETURN_URL = String(process.env.WIX_RETURN_URL || "");
 
-// Opcionales
+// Opcional
 const DISCORD_GUILD_ID = String(process.env.DISCORD_GUILD_ID || "");
 const DEFAULT_SCOPE = "identify";
 
-// ===== Utils ENV =====
+// ===== Utils =====
 function missingEnv() {
   const miss = [];
   if (!BOT_API_KEY) miss.push("BOT_API_KEY");
@@ -58,25 +77,27 @@ function jsonFail(error, details) {
   return out;
 }
 
-// ===== Anti doble exchange (TTL simple en memoria) =====
-const USED_CODES = new Map(); // code -> timestamp
-const CODE_TTL_MS = 5 * 60 * 1000; // 5 min
+// ===== Idempotencia exchange (cache TTL) =====
+// code -> { ts, payload: { discordId, discordUsername, discordTag } }
+const CODE_CACHE = new Map();
+const CODE_TTL_MS = 5 * 60 * 1000;
 
-function markCodeUsed(code) {
-  const now = Date.now();
-  USED_CODES.set(code, now);
-  for (const [k, t] of USED_CODES) {
-    if (now - t > CODE_TTL_MS) USED_CODES.delete(k);
+function cacheGet(code) {
+  const row = CODE_CACHE.get(code);
+  if (!row) return null;
+  if (Date.now() - row.ts > CODE_TTL_MS) {
+    CODE_CACHE.delete(code);
+    return null;
   }
+  return row.payload;
 }
-function wasCodeUsed(code) {
-  const t = USED_CODES.get(code);
-  if (!t) return false;
-  if (Date.now() - t > CODE_TTL_MS) {
-    USED_CODES.delete(code);
-    return false;
+function cacheSet(code, payload) {
+  CODE_CACHE.set(code, { ts: Date.now(), payload });
+  // limpieza ligera
+  const now = Date.now();
+  for (const [k, v] of CODE_CACHE) {
+    if (now - v.ts > CODE_TTL_MS) CODE_CACHE.delete(k);
   }
-  return true;
 }
 
 // ===== Discord OAuth =====
@@ -99,7 +120,6 @@ async function discordTokenExchange(code) {
   try { data = txt ? JSON.parse(txt) : null; } catch (_) {}
 
   if (!resp.ok || !data?.access_token) {
-    // Deja el texto para detectar invalid_grant arriba
     throw new Error(`token_exchange_failed:${resp.status}:${txt}`);
   }
   return data;
@@ -144,7 +164,10 @@ async function discordAddRole(guildId, userId, roleId) {
   if (!guildId) return false;
   const resp = await fetch(
     `https://discord.com/api/guilds/${guildId}/members/${userId}/roles/${roleId}`,
-    { method: "PUT", headers: { Authorization: `Bot ${DISCORD_TOKEN}` } }
+    {
+      method: "PUT",
+      headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
+    }
   );
   if (resp.status === 204) return true;
   if (!resp.ok) {
@@ -231,7 +254,7 @@ app.get("/oauth/discord/callback", (req, res) => {
 });
 
 // =========================================================
-// OAUTH START (y alias)
+// OAUTH START
 // =========================================================
 async function handleOauthStart(_req, res) {
   try {
@@ -260,7 +283,7 @@ app.post("/oauth/start", requireApiKey, handleOauthStart);
 app.post("/oauth/discord/start", requireApiKey, handleOauthStart);
 
 // =========================================================
-// OAUTH EXCHANGE (y alias)
+// OAUTH EXCHANGE - IDEMPOTENTE (NO 409)
 // =========================================================
 async function handleOauthExchange(req, res) {
   try {
@@ -270,12 +293,9 @@ async function handleOauthExchange(req, res) {
     const code = String(req.body?.code || "").trim();
     if (!code) return res.status(400).json(jsonFail("MISSING_CODE"));
 
-    // doble intento = 409
-    if (wasCodeUsed(code)) {
-      return res
-        .status(409)
-        .json(jsonFail("CODE_ALREADY_USED", "Este code ya fue canjeado (doble request)."));
-    }
+    // ✅ Si ya se procesó este code recientemente, devolver lo mismo
+    const cached = cacheGet(code);
+    if (cached) return res.json(jsonOk(cached));
 
     let token, me;
     try {
@@ -284,16 +304,13 @@ async function handleOauthExchange(req, res) {
     } catch (e) {
       const msg = String(e?.message || e);
 
-      // ✅ invalid_grant = 400 (no marcar como used)
+      // ✅ invalid_grant => code inválido/expirado/usado (Discord). No cachear.
       if (msg.includes("invalid_grant")) {
         return res.status(400).json(jsonFail("OAUTH_INVALID_GRANT", msg));
       }
 
       return res.status(502).json(jsonFail("OAUTH_PROVIDER_ERROR", msg));
     }
-
-    // ✅ SOLO aquí marcamos usado (cuando realmente lo canjeamos bien)
-    markCodeUsed(code);
 
     const discordId = me.id;
     const discordUsername = me.global_name || me.username || "Discord";
@@ -302,7 +319,12 @@ async function handleOauthExchange(req, res) {
         ? `${me.username}#${me.discriminator}`
         : me.username;
 
-    return res.json(jsonOk({ discordId, discordUsername, discordTag }));
+    const payload = { discordId, discordUsername, discordTag };
+
+    // ✅ cachea para doble request
+    cacheSet(code, payload);
+
+    return res.json(jsonOk(payload));
   } catch (e) {
     console.error("OAUTH_EXCHANGE_ERROR:", e);
     return res.status(500).json(jsonFail("OAUTH_EXCHANGE_FAILED", String(e?.message || e)));
@@ -313,7 +335,7 @@ app.post("/oauth/exchange", requireApiKey, handleOauthExchange);
 app.post("/oauth/discord/exchange", requireApiKey, handleOauthExchange);
 
 // =========================================================
-// RECRUITMENT SUBMIT (y alias)
+// RECRUITMENT SUBMIT
 // =========================================================
 async function handleRecruitmentSubmit(req, res) {
   try {
@@ -325,7 +347,7 @@ async function handleRecruitmentSubmit(req, res) {
     const ownerId = String(req.body?.ownerId || "").trim();
     const answers = req.body?.answers || {};
 
-    const roleId = String(req.body?.roleId || "").trim(); // opcional
+    const roleId = String(req.body?.roleId || "").trim();
     const channelId = String(req.body?.channelId || "").trim() || RECRUIT_CHANNEL_ID;
 
     if (!discordId) return res.status(400).json(jsonFail("MISSING_DISCORD_ID"));
@@ -356,4 +378,6 @@ async function handleRecruitmentSubmit(req, res) {
 app.post("/recruitment/submit", requireApiKey, handleRecruitmentSubmit);
 app.post("/oauth/discord/submit", requireApiKey, handleRecruitmentSubmit);
 
+// ===== Start =====
 app.listen(PORT, () => console.log("Ataraxia Render API on", PORT));
+
